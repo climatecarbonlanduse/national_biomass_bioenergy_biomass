@@ -1,0 +1,846 @@
+import geopandas as gpd
+import networkx as nx
+import pandas as pd
+import numpy as np
+from shapely.geometry import Point, LineString
+from scipy.spatial import cKDTree
+from tqdm import tqdm
+import warnings
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+# ---------- NETWORK BUILDER ----------
+def build_network_graph(gdf, graph):
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc="Building road network"):
+        geom = row.geometry
+        if geom is None:
+            continue
+
+        lines = [geom] if geom.geom_type == 'LineString' else (
+            geom.geoms if geom.geom_type == 'MultiLineString' else []
+        )
+
+        for line in lines:
+            coords = list(line.coords)
+            start, end = coords[0], coords[-1]
+            graph.add_edge(start, end, weight=line.length)
+
+    return graph
+
+
+def main():
+
+    print("\n=== BIOCHAR FACILITY MODEL (ITERATIVE, FULL UTILIZATION) ===\n")
+
+    # =============================================================================
+    # 0. GLOBAL PATHS
+    # =============================================================================
+    # Set your local or repository paths here
+    base_path = r'<INSERT_BASE_INPUT_DIRECTORY_HERE>'
+    out_path = r'<INSERT_OUTPUT_DIRECTORY_HERE>'
+    
+    # ---------- LOAD DATA ----------
+    print("1. Loading data...")
+    # Adjust relative paths/filenames to match your repository structure
+    polygons = gpd.read_file(f'{base_path}/merged/skordeomrade_halm_stats.shp')
+    roads = gpd.read_file(f'{base_path}/roads/Road_Network_Merged.shp')
+    
+    # =============================================================================
+    # MODEL OPTIONS
+    # =============================================================================
+    CALCULATE_SAF_TRANSPORT = False
+    
+    MAX_CATCHMENT_RADIUS_KM = 1  # Change this for your sensitivity analysis
+    
+    if CALCULATE_SAF_TRANSPORT:
+        refinery_path = r'<INSERT_REFINERY_SCENARIO_DIRECTORY_HERE>'
+        refinery = gpd.read_file(f'{refinery_path}/raff_location.shp')
+        
+    # Set target CRS for accurate distance calculations (e.g., EPSG:3006 for SWEREF 99 TM)
+    target_crs = "<SET_TARGET_CRS_HERE>" 
+    polygons = polygons.to_crs(target_crs)
+    roads = roads.to_crs(target_crs)
+
+    # ---------- BIOMASS ----------
+    print("2. Preparing biomass...")
+    
+    dry_factor = 1
+    
+    # Sensitivity modifier (e.g., 0.8, 1.0, 1.2)
+    sensitive_biochar = 1
+    
+    # Base yields
+    base_biochar = 0.34
+    base_biooil = 0.33
+    base_biogas = 0.30
+    
+    # Apply sensitivity to biochar
+    biochar_factor = base_biochar * sensitive_biochar
+    
+    # Mass balance closure: distribute the remaining mass loss/gain to bio-oil
+    remaining_mass = 1.0 - biochar_factor
+    biooil_conversion_factor = remaining_mass * 0.60  # proportional split
+    biogas_conversion_factor = remaining_mass * 0.40
+    
+    polygons['Region pot'] = polygons['Region pot'].astype(str).str.replace(',', '').astype(float)
+    polygons['biomass_t'] = polygons['Region pot'] * dry_factor
+
+    polygons = polygons[polygons['biomass_t'] > 0].copy()
+
+    # ---------- NETWORK ----------
+    print("3. Building network...")
+    G = nx.Graph()
+    G = build_network_graph(roads, G)
+
+    nodes = list(G.nodes())
+    tree = cKDTree(nodes)
+
+    polygons['net_node'] = polygons.geometry.centroid.apply(
+        lambda g: nodes[tree.query((g.x, g.y))[1]]
+    )
+    
+    if CALCULATE_SAF_TRANSPORT:
+        refinery['net_node'] = refinery.geometry.centroid.apply(
+            lambda g: nodes[tree.query((g.x, g.y))[1]]
+        )
+
+    # ---------- PARAMETERS ----------
+    LOCAL_CAP = 5000 
+    REGIONAL_CAP = 30000 
+    DIST_LIMIT = 100000 * MAX_CATCHMENT_RADIUS_KM  # meters
+
+    # ---------- STORAGE ----------
+    plant_records = []
+    flows = []
+
+    plant_id = 1
+
+    print("4. Iteratively building plants...\n")
+
+    # ---------- MAIN LOOP ----------
+    while True:
+
+        # Stop if not enough biomass left
+        total_remaining = polygons['biomass_t'].sum()
+        if total_remaining < LOCAL_CAP:
+            print("No more viable plants can be built.")
+            break
+
+        # --- Seed selection ---
+        seed_idx = polygons['biomass_t'].idxmax()
+        seed_node = polygons.loc[seed_idx, 'net_node']
+
+        # --- Dijkstra ---
+        distances = nx.single_source_dijkstra_path_length(
+            G, seed_node, cutoff=DIST_LIMIT, weight='weight'
+        )
+
+        # --- Sort polygons by distance ---
+        candidate_polys = []
+
+        for idx, row in polygons.iterrows():
+            dist = distances.get(row['net_node'], None)
+            if dist is None:
+                continue
+            candidate_polys.append((idx, dist))
+
+        candidate_polys = sorted(candidate_polys, key=lambda x: x[1])
+
+        # --- Grow catchment ---
+        collected = 0
+        allocation = []
+
+        for idx, dist in candidate_polys:
+            available = polygons.at[idx, 'biomass_t']
+            if available <= 0:
+                continue
+
+            take = available
+            allocation.append([idx, take, dist])
+            collected += take
+
+            if collected >= REGIONAL_CAP:
+                break
+
+        # --- Decide plant type ---
+        if collected >= REGIONAL_CAP:
+            capacity = REGIONAL_CAP
+            ptype = "Regional"
+        elif collected >= LOCAL_CAP:
+            capacity = LOCAL_CAP
+            ptype = "Local"
+        else:
+            print("Remaining biomass too small → stopping.")
+            break
+
+        # --- Trim to exact capacity ---
+        trimmed_alloc = []
+        running = 0
+
+        for idx, take, dist in allocation:
+            if running + take <= capacity:
+                trimmed_alloc.append([idx, take, dist])
+                running += take
+            else:
+                remaining = capacity - running
+                if remaining > 0:
+                    trimmed_alloc.append([idx, remaining, dist])
+                    running += remaining
+                break
+
+        # --- Compute plant location (weighted centroid) ---
+        xs, ys, ws = [], [], []
+
+        for idx, take, _ in trimmed_alloc:
+            centroid = polygons.loc[idx].geometry.centroid
+            xs.append(centroid.x)
+            ys.append(centroid.y)
+            ws.append(take)
+
+        x = np.average(xs, weights=ws)
+        y = np.average(ys, weights=ws)
+
+        _, node_idx = tree.query((x, y))
+        plant_node = nodes[node_idx]
+
+        # ---------- SAVE FLOWS ----------
+        for idx, take, dist in trimmed_alloc:
+
+            biochar = take * biochar_factor
+            biooil = take * biooil_conversion_factor
+            biogas = take * biogas_conversion_factor
+
+            flows.append({
+                'plant_id': plant_id,
+                'poly_idx': idx,
+                'biomass_t': take,
+                'biochar_t': biochar,
+                'biooil_t': biooil,
+                'biogas_t': biogas,
+                'distance_m': dist
+            })
+
+            # subtract biomass
+            polygons.at[idx, 'biomass_t'] -= take
+
+        # ---------- SAVE PLANT ----------
+        plant_records.append({
+            'plant_id': plant_id,
+            'type': ptype,
+            'capacity': capacity,
+            'geometry': Point(x, y),
+            'node': plant_node
+        })
+
+        print(f"Plant {plant_id}: {ptype} built ({capacity:,.0f} t)")
+
+        plant_id += 1
+
+    # ---------- DATAFRAMES ----------
+    plants = gpd.GeoDataFrame(plant_records, crs=target_crs)
+    flows_df = pd.DataFrame(flows)
+
+    # ---------- TRANSPORT ----------
+    print("\n5. Calculating transport...")
+
+    flows_df['distance_km'] = flows_df['distance_m'] / 1000
+
+    flows_df['forward_tkm'] = flows_df['biomass_t'] * flows_df['distance_km']
+    flows_df['return_tkm'] = flows_df['biochar_t'] * flows_df['distance_km']
+    flows_df['total_tkm'] = flows_df['forward_tkm'] + flows_df['return_tkm']
+
+    # ---------- SUMMARY ----------
+    print("\n=== SYSTEM SUMMARY ===")
+
+    total_biomass = flows_df['biomass_t'].sum()
+    total_biochar = flows_df['biochar_t'].sum()
+    total_tkm = flows_df['total_tkm'].sum()
+
+    print(f"Total biomass used: {total_biomass:,.0f} t")
+    print(f"Total biochar: {total_biochar:,.0f} t")
+    print(f"Total transport: {total_tkm:,.0f} tkm")
+    if total_biochar > 0:
+        print(f"Transport per tonne biochar: {total_tkm / total_biochar:.2f} tkm/t")
+
+    # ---------- SPIDER LINES ----------
+    print("6. Creating spider lines...")
+
+    lines = []
+    for _, row in flows_df.iterrows():
+        poly = polygons.loc[row['poly_idx']].geometry.centroid
+        plant = plants[plants['plant_id'] == row['plant_id']].geometry.values[0]
+
+        lines.append({
+            'plant_id': row['plant_id'],
+            'biomass_t': row['biomass_t'],
+            'geometry': LineString([poly, plant])
+        })
+
+    spider = gpd.GeoDataFrame(lines, crs=target_crs)
+
+    # ---------- SAVE ----------
+    print("7. Saving outputs...")
+
+    plants.to_file(f"{out_path}/plants.shp")
+    spider.to_file(f"{out_path}/spider_lines.shp")
+    flows_df.to_csv(f"{out_path}/flows.csv", index=False)
+
+    print("\n✅ DONE — Model complete.\n")
+    
+    
+    # ---------- STEP X: ROAD NETWORK TRANSPORT ANALYSIS ----------
+    print("\n8. Calculating ROAD-based transport distances (true paths)...")
+
+    # Unique OD pairs (plant-field)
+    unique_paths = flows_df[['plant_id', 'poly_idx']].drop_duplicates()
+
+    path_stats = []
+
+    print("Tracing shortest paths on road network...")
+
+    for _, row in tqdm(unique_paths.iterrows(), total=len(unique_paths), desc="Road routing"):
+
+        plant_id = row['plant_id']
+        poly_idx = row['poly_idx']
+
+        start_node = polygons.loc[poly_idx, 'net_node']
+        end_node = plants.loc[plants['plant_id'] == plant_id, 'node'].values[0]
+
+        road_km = 0
+
+        try:
+            path = nx.shortest_path(G, source=start_node, target=end_node, weight='weight')
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                edge_data = G.get_edge_data(u, v)
+
+                road_km += edge_data.get('weight', 0) / 1000
+
+        except:
+            # fallback: straight line
+            road_km = Point(start_node).distance(Point(end_node)) / 1000
+
+        path_stats.append({
+            'plant_id': plant_id,
+            'poly_idx': poly_idx,
+            'road_km': road_km
+        })
+
+    path_df = pd.DataFrame(path_stats)
+    
+    # ---------- FIELD OPERATION BASELINE (TRACTOR DRIVING) ----------
+
+    # Assumptions:
+    # 2 t biomass per km²
+    # 100 km driving per km²
+    # => 50 km per ton biomass
+    FIELD_KM_PER_TON = 100
+
+    # ---------- MERGE WITH FLOWS ----------
+    final_flows = flows_df.merge(path_df, on=['plant_id', 'poly_idx'], how='left')
+    
+    # distance driven in field (km)
+    final_flows['field_km'] = final_flows['biomass_t'] * FIELD_KM_PER_TON
+
+    # convert to tkm (same logic as transport)
+    final_flows['field_tkm'] = final_flows['biomass_t'] * FIELD_KM_PER_TON
+
+    # ---------- TRUE TRANSPORT CALCULATIONS ----------
+    if CALCULATE_SAF_TRANSPORT:
+
+        print("Calculating distances from plants to SAF Refinery...")
+
+        refinery_nodes = refinery['net_node'].tolist()
+        plant_refinery_dist = {}
+
+        for plant_id in plants['plant_id'].unique():
+
+            source_node = plants.loc[
+                plants['plant_id'] == plant_id,
+                'node'
+            ].values[0]
+
+            min_dist = float("inf")
+
+            for ref_node in refinery_nodes:
+
+                try:
+                    path = nx.shortest_path(
+                        G,
+                        source=source_node,
+                        target=ref_node,
+                        weight="weight"
+                    )
+
+                    dist_m = sum(
+                        G.get_edge_data(path[i], path[i+1])["weight"]
+                        for i in range(len(path)-1)
+                    )
+
+                    min_dist = min(min_dist, dist_m)
+
+                except:
+                    pass
+
+            plant_refinery_dist[plant_id] = min_dist / 1000
+
+        final_flows["plant_refinery_km"] = (
+            final_flows["plant_id"].map(plant_refinery_dist)
+        )
+
+    else:
+        final_flows["plant_refinery_km"] = 0
+
+    # ---------- COMMON CALCULATIONS ----------
+    final_flows["forward_tkm"] = (
+        final_flows["biomass_t"] * final_flows["road_km"]
+    )
+
+    final_flows["return_tkm"] = (
+        final_flows["biochar_t"] * final_flows["road_km"]
+    )
+
+    final_flows["oil_tkm"] = (
+        final_flows["biooil_t"] * final_flows["plant_refinery_km"]
+    )
+
+    final_flows["total_tkm"] = (
+        final_flows["forward_tkm"] +
+        final_flows["return_tkm"] +
+        final_flows["field_tkm"] +
+        final_flows["oil_tkm"]
+    )
+        
+    plant_logistics = final_flows.groupby('plant_id').agg({
+        'road_km': 'mean',
+        'plant_refinery_km': 'mean', 
+        'forward_tkm': 'sum',
+        'return_tkm': 'sum',
+        'field_tkm': 'sum',
+        'oil_tkm': 'sum',            
+        'total_tkm': 'sum',
+        'biomass_t': 'sum',
+        'biochar_t': 'sum',
+        'biooil_t': 'sum',   
+        'biogas_t': 'sum'    
+    }).reset_index()
+
+    # Transport intensity
+    plant_logistics['tkm_per_biochar'] = plant_logistics['total_tkm'] / plant_logistics['biochar_t']
+
+    # ---------- MERGE INTO PLANTS ----------
+    plants = plants.merge(plant_logistics, on='plant_id', how='left')
+
+    # Fill NaN (just in case)
+    plants = plants.fillna(0)
+
+    # Rename nicely
+    plants = plants.rename(columns={
+        'road_km': 'avg_dist_km',
+        'plant_refinery_km': 'refinery_km',
+        'biomass_t': 'biomass_in_t',
+        'biochar_t': 'biochar_out_t',
+        'biooil_t': 'biooil_out_t',   
+        'biogas_t': 'biogas_out_t',   
+        'total_tkm': 'total_tkm',
+        'forward_tkm': 'forward_tkm',
+        'return_tkm': 'return_tkm',
+        'oil_tkm': 'oil_tkm'
+    })
+
+    print("✅ Plant-level logistics calculated and merged.")
+    
+    # ---------- SAVE PLANTS WITH LOGISTICS ----------
+    print("Saving plants with logistics attributes...")
+
+    # --- Clean column names for shapefile (<=10 chars) ---
+    plants_export = plants.copy()
+
+    plants_export = plants_export.rename(columns={
+        'biomass_in_t': 'bio_in_t',
+        'biochar_out_t': 'bio_out_t',
+        'avg_dist_km': 'avg_km',
+        'refinery_km': 'ref_km',      
+        'forward_tkm': 'fwd_tkm',
+        'return_tkm': 'ret_tkm',
+        'oil_tkm': 'oil_tkm',         
+        'total_tkm': 'tot_tkm',
+        'tkm_per_biochar': 'tkm_per_t',
+        'biooil_out_t': 'oil_out_t',  
+        'biogas_out_t': 'gas_out_t',  
+    })
+
+    # Fill NaNs just in case
+    plants_export = plants_export.fillna(0)
+
+    # --- Save new shapefile ---
+    plants_log_path = f"{out_path}/plants_with_logistics.shp"       
+    plants_export.to_file(plants_log_path)
+
+    # ---------- OPTIONAL: ALSO SAVE FLOWS WITH ROAD DATA ----------
+    flows_log_path = f"{out_path}/flows_with_logistics.csv"         
+    final_flows.to_csv(flows_log_path, index=False)
+    
+    print(f"✅ Flows with road logistics saved: {flows_log_path}")
+    
+    # =============================================================================
+    # FINAL SYSTEM SUMMARY PRINT (AGRI)
+    # =============================================================================
+    # Calculate totals from the updated 'plants' dataframe
+    total_biomass = plants['biomass_in_t'].sum()
+    total_biochar = plants['biochar_out_t'].sum()
+    total_biooil = plants['biooil_out_t'].sum()
+    total_biogas = plants['biogas_out_t'].sum()
+    
+    total_plants = len(plants)
+    regional_plants = len(plants[plants['type'] == 'Regional'])
+    local_plants = len(plants[plants['type'] == 'Local'])
+    
+    total_forward_tkm = plants['forward_tkm'].sum()
+    total_return_tkm = plants['return_tkm'].sum()
+    total_field_tkm = plants['field_tkm'].sum()
+    total_oil_tkm = plants['oil_tkm'].sum()
+    total_system_tkm = plants['total_tkm'].sum()
+    
+    avg_road_km = plants['avg_dist_km'].mean()
+    avg_refinery_km = plants['refinery_km'].mean()
+    tkm_per_tonne_char = total_system_tkm / total_biochar if total_biochar > 0 else 0
+    
+    # Standard estimate: 1 tonne of biochar sequesters roughly 2.8 tonnes of CO2 equivalent
+    co2_seq_est = total_biochar * 2.8 
+    est_transport_co2 = (total_system_tkm * 0.090) / 1000
+
+    print("\n" + "="*70)
+    print("=== AGRI / BIOCHAR SYSTEM SUMMARY ===")
+    print("="*70)
+    print(f"TOTAL BIOMASS PROCESSED: {total_biomass:,.0f} t")
+    print("-" * 70)
+    print(f"TOTAL BIOCHAR PRODUCED:  {total_biochar:,.0f} t (Yield: {biochar_factor*100:.0f}%)")
+    print(f"TOTAL BIO-OIL BYPRODUCT: {total_biooil:,.0f} t (Yield: {biooil_conversion_factor*100:.0f}%)")
+    print(f"TOTAL BIOGAS BYPRODUCT:  {total_biogas:,.0f} t (Yield: {biogas_conversion_factor*100:.0f}%)")
+    print(f"EST. CO2 SEQUESTERED:    ~{co2_seq_est:,.0f} t CO2e")
+    print("-" * 70)
+    print(f"TOTAL PLANTS BUILT:      {total_plants} ({regional_plants} Regional, {local_plants} Local)")
+    print("-" * 70)
+    print("LOGISTICS & TRANSPORT BREAKDOWN:")
+    print(f"  Avg Dist: Field to Plant:  {avg_road_km:,.1f} km")
+    print(f"  Avg Dist: Plant to SAF:    {avg_refinery_km:,.1f} km")
+    print("")
+    print(f"  Biomass to Plant:          {total_biomass:,.0f} t    | {total_forward_tkm:,.0f} tkm")
+    print(f"  Biochar back to Field:     {total_biochar:,.0f} t    | {total_return_tkm:,.0f} tkm")
+    print(f"  Bio-oil to SAF Refinery:   {total_biooil:,.0f} t    | {total_oil_tkm:,.0f} tkm")
+    print(f"  Field Operations:                               | {total_field_tkm:,.0f} tkm")
+    print("")
+    print(f"  TOTAL SYSTEM TKM:          {total_system_tkm:,.0f} tkm")
+    print(f"  INTENSITY:                 {tkm_per_tonne_char:,.2f} tkm per tonne of biochar")
+    print(f"  EST. TRANSPORT CO2:        {est_transport_co2:,.0f} t CO2e")
+    print("="*70 + "\n")
+    
+    # =============================================================================
+    # 10. REGIONAL FLOW ANALYSIS (ORIGIN TO DESTINATION)
+    # =============================================================================
+    print("\n" + "="*70)
+    print("      📍 REGIONAL BIOMASS FLOW ANALYSIS (AGRI SCENARIO)")
+    print("="*70)
+
+    # 1. Load PR Shapefile
+    po8_path = r'<INSERT_REGIONAL_BOUNDARIES_SHAPEFILE_PATH_HERE>'
+    try:
+        po8 = gpd.read_file(po8_path)
+        po8 = po8.to_crs(target_crs)
+        
+        # Find the PR ID column name dynamically
+        possible_cols = [c for c in po8.columns if any(x in c.upper() for x in ['PO', 'PROD', 'NAMN', 'NAME'])]
+        PR_COL = possible_cols[0] if possible_cols else 'index_right'
+
+        # 2. Assign PR to Fields (Polygons) via centroid intersection
+        poly_centroids = polygons.copy()
+        poly_centroids.geometry = poly_centroids.geometry.centroid
+        poly_with_pr = gpd.sjoin(poly_centroids, po8[[PR_COL, 'geometry']], how='left', predicate='intersects')
+        poly_with_pr = poly_with_pr[~poly_with_pr.index.duplicated(keep='first')]
+        field_pr_map = poly_with_pr[PR_COL].to_dict()
+
+        # 3. Assign PR to Plants
+        plants_with_pr = gpd.sjoin(plants, po8[[PR_COL, 'geometry']], how='left', predicate='intersects')
+        plants_with_pr = plants_with_pr[~plants_with_pr.index.duplicated(keep='first')]
+        plant_pr_map = plants_with_pr.set_index('plant_id')[PR_COL].to_dict()
+
+        # 4. Map PRs onto the final_flows dataframe
+        if not final_flows.empty:
+            final_flows['source_PR'] = final_flows['poly_idx'].map(field_pr_map).fillna('Unknown')
+            final_flows['dest_PR'] = final_flows['plant_id'].map(plant_pr_map).fillna('Unknown')
+
+            # 5. Calculate System Totals
+            total_used = final_flows['biomass_t'].sum()
+            total_avail = polygons['biomass_t'].sum() + total_used
+
+            print(f"Total Biomass Assumed to Exist:  {total_avail:,.0f} tonnes")
+            print(f"Total Biomass Actually Used:     {total_used:,.0f} tonnes")
+            print(f"Total System Utilization Rate:   {(total_used/total_avail)*100:.1f}%\n")
+
+            # 6. Usage per Region (Destination/Plant perspective)
+            print("BELOW HERE IS THE DATA FOR REGIONS TO CHECK")
+            # Original biomass potential by PR
+            poly_with_pr['potential_t'] = (
+                polygons.loc[poly_with_pr.index, 'Region pot']
+                .astype(str)
+                .str.replace(',', '')
+                .astype(float)
+            )
+
+            pr_potential = poly_with_pr.groupby(PR_COL)['potential_t'].sum()
+
+            # Biomass actually received by plants in each PR
+            dest_usage = final_flows.groupby('dest_PR')['biomass_t'].sum()
+
+            # Combine
+            region_summary = pd.DataFrame({
+                'Potential_t': pr_potential,
+                'Received_t': dest_usage
+            }).fillna(0)
+
+            # Utilization
+            region_summary['Utilization_%'] = (
+                region_summary['Received_t']
+                / region_summary['Potential_t']
+                * 100
+            ).round(1)
+
+            region_summary = region_summary.sort_values(
+                'Potential_t',
+                ascending=False
+            )
+
+            print("--- Production Region Biomass Summary ---")
+            print(region_summary.to_string(float_format="{:,.0f}".format))
+            print("\n")
+
+            # 7. Inter-regional Flows Matrix
+            flow_matrix = final_flows.pivot_table(
+                values='biomass_t', 
+                index='source_PR', 
+                columns='dest_PR', 
+                aggfunc='sum', 
+                fill_value=0
+            )
+
+            print("--- Biomass Flows Matrix (Tonnes) ---")
+            print("Rows: Where it comes from | Columns: Where it goes")
+            print(flow_matrix.round(0).to_string())
+
+            # 8. Export Matrix to Excel
+            flow_excel_path = f'{out_path}/regional_agri_flows.xlsx'
+            flow_matrix.to_excel(flow_excel_path)
+            print(f"\n✅ Regional flow matrix saved to:\n{flow_excel_path}")
+
+        else:
+            print("⚠️ No flows were generated in this run. Cannot calculate regional routing.")
+
+    except Exception as e:
+        print(f"❌ Could not load PR shapefile or calculate flows. Error: {e}")
+
+    print("="*70 + "\n")
+    
+    # =============================================================================
+    # 11. BIOMASS AVAILABILITY VS. ACTUAL INTAKE PLOT (AGRI SCENARIO)
+    # =============================================================================
+    
+    print("\n11. Generating Biomass Availability vs. Actual Intake Curves (Standard, A4, & Half-A4)...")
+
+    # --- 1. THEORETICAL AVAILABILITY (What is physically close enough) ---
+    plant_coords = np.array([(geom.x, geom.y) for geom in plants.geometry])
+    poly_coords = np.array([(geom.centroid.x, geom.centroid.y) for geom in polygons.geometry])
+    
+    plant_tree = cKDTree(plant_coords)
+    distances_m, nearest_indices = plant_tree.query(poly_coords)
+    
+    # Euclidean distance * 1.3 (tortuosity factor) to estimate road distance
+    polygons['nearest_plant_km'] = (distances_m / 1000) * 1.3
+    
+    distance_limits = list(range(0, 210, 10))
+    max_plot_dist = distance_limits[-1]
+    cumulative_theoretical = []
+    
+    # Reconstruct the original biomass since the main loop subtracted from 'biomass_t'
+    polygons['orig_bio_t'] = polygons['Region pot'].astype(str).str.replace(',', '').astype(float) * dry_factor
+    
+    for dist in distance_limits:
+        avail_t = polygons.loc[polygons['nearest_plant_km'] <= dist, 'orig_bio_t'].sum()
+        cumulative_theoretical.append(avail_t)
+
+    # --- 2. ACTUAL INTAKE (Bounded by your model limit) ---
+    cumulative_actual = []
+    model_limit = 100  # Hard limit for baseline scenario
+   
+    if not flows_df.empty:
+        for dist in distance_limits:
+            taken_t = flows_df.loc[flows_df['distance_km'] <= dist, 'biomass_t'].sum()
+            cumulative_actual.append(taken_t)
+    else:
+        cumulative_actual = [0] * len(distance_limits)
+
+    # --- VISUAL FIX: Force Green Line to start with/stay under Blue Line ---
+    cumulative_actual = [min(act, theo) for act, theo in zip(cumulative_actual, cumulative_theoretical)]
+
+    # --- 3. THE "WHAT-IF" SCENARIO (>100km) ---
+    leftover_fields = polygons[polygons['biomass_t'] > 0].copy()
+    leftover_fields['leftover_t'] = leftover_fields['biomass_t']
+    
+    total_unmet_potential = leftover_fields['leftover_t'].sum()
+    simulated_takes = []
+
+    if not leftover_fields.empty and total_unmet_potential > 0:
+        max_d_near = leftover_fields['nearest_plant_km'].max()
+        min_d_near = leftover_fields['nearest_plant_km'].min()
+        
+        for _, row in leftover_fields.iterrows():
+            available = row['leftover_t']
+            d_near = row['nearest_plant_km']
+            if max_d_near > min_d_near:
+                normalized_isolation = ((d_near - min_d_near) / (max_d_near - min_d_near)) ** 0.7
+            else:
+                normalized_isolation = 0.5
+                
+            simulated_dist = 101 + (normalized_isolation * (max_plot_dist - 105))
+            simulated_takes.append({'dist_km': simulated_dist, 'take_t': available})
+
+    sim_df = pd.DataFrame(simulated_takes) if simulated_takes else pd.DataFrame(columns=['dist_km', 'take_t'])
+
+    cumulative_what_if = []
+    base_actual_total = flows_df.loc[flows_df['distance_km'] <= model_limit, 'biomass_t'].sum() if not flows_df.empty else 0
+
+    for dist in distance_limits:
+        if dist <= model_limit:
+            cumulative_what_if.append(cumulative_actual[distance_limits.index(dist)])
+        else:
+            sim_taken = sim_df.loc[sim_df['dist_km'] <= dist, 'take_t'].sum() if not sim_df.empty else 0
+            theo_limit_at_dist = cumulative_theoretical[distance_limits.index(dist)]
+            projected_total = min(base_actual_total + sim_taken, theo_limit_at_dist)
+            cumulative_what_if.append(projected_total)
+
+
+    total_country_potential = polygons['orig_bio_t'].sum()
+    actual_plot_x = [d for d in distance_limits if d <= model_limit]
+    actual_plot_y = cumulative_actual[:len(actual_plot_x)]
+
+    sns.set_theme(style="whitegrid")
+
+    # =========================================================================
+    # PLOT 1: STANDARD VERSION (13x8)
+    # =========================================================================
+    plt.figure(figsize=(13, 8))
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=2.5, markersize=8, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=2.5, markersize=8, label='Unrestricted Scenario (>100km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=3, markersize=8, label='Baseline Scenario (≤100km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2, label='Baseline Distance Limit (100km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=14)
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=14)
+    plt.xticks(distance_limits, fontsize=12, rotation=45)
+    plt.yticks(fontsize=12)
+    ax1 = plt.gca()
+    ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    plt.legend(fontsize=11, loc='lower right', frameon=True, shadow=True)
+    plt.tight_layout()
+    dist_plot_path = f'{out_path}/agri_biomass_vs_distance_curve.png'
+    plt.savefig(dist_plot_path, dpi=400)
+    plt.close()
+
+    # =========================================================================
+    # PLOT 2: A4 PUBLICATION VERSION (10x6.5)
+    # =========================================================================
+    plt.figure(figsize=(10, 6.5))
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=3.5, markersize=10, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=3.5, markersize=10, label='Unrestricted Scenario (>100km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=4, markersize=10, label='Baseline Scenario (≤100km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2.5, label='Baseline Distance Limit (100km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2.5, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=16, fontweight='bold')
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=16, fontweight='bold')
+    plt.xticks(distance_limits, fontsize=14, rotation=45)
+    plt.yticks(fontsize=14)
+    ax2 = plt.gca()
+    ax2.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    plt.legend(fontsize=12, loc='lower right', frameon=True, shadow=True)
+    plt.tight_layout()
+    dist_plot_path_a4 = f'{out_path}/agri_biomass_vs_distance_curve_A4_PRINT.png'
+    plt.savefig(dist_plot_path_a4, dpi=600)
+    plt.close()
+
+    # =========================================================================
+    # PLOT 3: HALF-A4 / SIDE-BY-SIDE VERSION (6.5x6)
+    # =========================================================================
+    plt.figure(figsize=(6.5, 6))
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=2.5, markersize=6, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=2.5, markersize=6, label='Unrestricted Scenario (>100km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=3, markersize=6, label='Baseline Scenario (≤100km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2, label='Baseline Distance Limit (100km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=12, fontweight='bold')
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=12, fontweight='bold')
+    plt.xticks(distance_limits[::2], fontsize=10, rotation=45) 
+    plt.yticks(fontsize=10)
+    
+    ax3 = plt.gca()
+    ax3.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    
+    plt.legend(fontsize=9, loc='lower right', frameon=True, shadow=False)
+    plt.tight_layout()
+    
+    dist_plot_path_half_a4 = f'{out_path}/agri_biomass_vs_distance_curve_HALF_A4.png'
+    plt.savefig(dist_plot_path_half_a4, dpi=600)
+    plt.close()
+
+    print(f"✅ Standard plot saved to: {dist_plot_path}")
+    print(f"✅ A4 Print-ready plot saved to: {dist_plot_path_a4}")
+    print(f"✅ Half-A4 Side-by-Side plot saved to: {dist_plot_path_half_a4}")
+    
+    # =============================================================================
+    # 12. FIELD UTILIZATION SHAPEFILE
+    # =============================================================================
+    print("\n12. Generating Field Utilization Shapefile...")
+
+    # 1. Reconstruct the original starting biomass
+    polygons['orig_bio_t'] = polygons['Region pot'] * dry_factor
+    
+    # 2. Calculate exactly how much was taken from each field
+    if not flows_df.empty:
+        taken_per_poly = flows_df.groupby('poly_idx')['biomass_t'].sum()
+        polygons['used_bio_t'] = polygons.index.map(taken_per_poly).fillna(0)
+    else:
+        polygons['used_bio_t'] = 0
+
+    # 3. Calculate what is actually leftover (Stranded)
+    polygons['leftover_t'] = polygons['orig_bio_t'] - polygons['used_bio_t']
+    
+    # 4. Calculate utilization percentage
+    polygons['util_pct'] = (polygons['used_bio_t'] / polygons['orig_bio_t']).fillna(0) * 100
+    polygons['util_pct'] = polygons['util_pct'].clip(lower=0, upper=100).round(2)
+    
+    # 5. Create a readable status tag
+    def assign_status(pct):
+        if pct > 99: return 'Fully Utilized'
+        elif pct > 0: return 'Partially Utilized'
+        else: return 'Stranded (Too far/No Demand)'
+        
+    polygons['status'] = polygons['util_pct'].apply(assign_status)
+
+    # 6. Save the Shapefile
+    out_util_path = f'{out_path}/field_utilization_status_agri.shp'
+    
+    cols_to_keep = ['Region pot', 'orig_bio_t', 'used_bio_t', 'leftover_t', 'util_pct', 'status', 'geometry']
+    polygons[cols_to_keep].to_file(out_util_path)
+    
+    print(f"✅ Field utilization shapefile saved to: {out_util_path}")
+
+if __name__ == "__main__":
+    main()
