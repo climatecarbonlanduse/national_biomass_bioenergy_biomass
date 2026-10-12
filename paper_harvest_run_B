@@ -1,0 +1,769 @@
+import geopandas as gpd
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import matplotlib.patches as mpatches
+
+# =================================================================
+# 1. GLOBAL PATHS & PARAMETERS
+# =================================================================
+# Set your local or repository paths here
+PLOT_OUTPUT_FOLDER = r'<INSERT_PLOT_OUTPUT_DIRECTORY_HERE>'
+os.makedirs(PLOT_OUTPUT_FOLDER, exist_ok=True)
+
+PO8_SHP_PATH = r'<INSERT_REGIONAL_BOUNDARIES_SHAPEFILE_PATH_HERE>'
+
+CO2_CONVERSION = 3.67
+TOTAL_HECTARES = <SET_TOTAL_AREA_IN_HECTARES_HERE> # e.g., 887000
+
+# =================================================================
+# 2. SCENARIO CONFIGURATION
+# =================================================================
+scenarios = {
+    'Heatplants': {
+        'shp_path': r'<INSERT_HEATPLANTS_CLIMATE_ACCOUNTING_SHP_HERE>',
+        'data_out': r'<INSERT_HEATPLANTS_RESULTS_OUTPUT_DIR_HERE>',
+        'field_shp_path': r'<INSERT_HEATPLANTS_FIELD_STATUS_SHP_HERE>',
+        'primary_sink_col': 'sink_tCO2',
+        'primary_sink_label': 'Biochar Carbon Sink',
+        'secondary_sink_col': 'avoided_tCO2_saf',
+        'tertiary_sink_col': 'avoided_tCO2_fuels',
+        'tertiary_sink_label': 'Fuel Substitution (Bio-oil/Gas)'
+    },
+    'Agri': {
+        'shp_path': r'<INSERT_AGRI_CLIMATE_ACCOUNTING_SHP_HERE>',
+        'data_out': r'<INSERT_AGRI_RESULTS_OUTPUT_DIR_HERE>',
+        'field_shp_path': r'<INSERT_AGRI_FIELD_STATUS_SHP_HERE>', 
+        'primary_sink_col': 'sink_tCO2',
+        'primary_sink_label': 'Biochar Carbon Sink',
+        'secondary_sink_col': 'avoided_tCO2_saf',
+        'tertiary_sink_col': 'avoided_tCO2_fuels',
+        'tertiary_sink_label': 'Fuel Substitution (Bio-oil/Gas)'
+    },
+    'BioOil': {
+        'shp_path': r'<INSERT_BIOOIL_CLIMATE_ACCOUNTING_SHP_HERE>',
+        'data_out': r'<INSERT_BIOOIL_RESULTS_OUTPUT_DIR_HERE>',
+        'field_shp_path': r'<INSERT_BIOOIL_FIELD_STATUS_SHP_HERE>',
+        'primary_sink_col': 'avoided_tCO2',
+        'primary_sink_label': 'Avoided Fossil Emissions (SAF)',
+        'secondary_sink_col': 'added_sink_tCO2',
+        'secondary_sink_label': 'Added Biochar Sink',
+        'tertiary_sink_col': 'avoided_tCO2_fuels',
+        'tertiary_sink_label': 'Fuel Substitution (Biogas only)'
+    }
+}
+
+# =================================================================
+# 3. CORE PROCESSING FUNCTION
+# =================================================================
+def run_scenario_analysis(scenario_name, config, po8_gdf):
+    print(f"\n{'='*50}\n🚀 RUNNING SCENARIO: {scenario_name}\n{'='*50}")
+    os.makedirs(config['data_out'], exist_ok=True)
+    
+    print("--- Loading Spatial Data ---")
+    gdf = gpd.read_file(config['shp_path'])
+    if gdf.crs != po8_gdf.crs:
+        gdf = gdf.to_crs(po8_gdf.crs)
+
+    print("--- Standardizing Shapefile Column Names ---")
+    rename_map = {
+        'oil_out_t': 'biooil_t',   
+        'gas_out_t': 'biogas_t',   
+        'bc_out_t': 'bio_out_t'    
+    }
+    
+    for old_col, new_col in rename_map.items():
+        if old_col in gdf.columns:
+            if new_col in gdf.columns:
+                gdf = gdf.drop(columns=[new_col])
+            gdf = gdf.rename(columns={old_col: new_col})
+            
+    gdf = gdf.loc[:, ~gdf.columns.duplicated()]
+    
+    print("--- Linking Plants to PO8 Regions ---")
+    gdf = gpd.sjoin(gdf, po8_gdf, how='left', predicate='within')
+    possible_cols = [c for c in po8_gdf.columns if any(x in c.upper() for x in ['PO', 'PROD', 'NAMN', 'NAME'])]
+    PO8_ID_COL = possible_cols[0] if possible_cols else 'index_right'
+    id_col_to_check = 'plt_name' if 'plt_name' in gdf.columns else ('plant_id' if 'plant_id' in gdf.columns else None)
+    if id_col_to_check:
+        gdf = gdf.drop_duplicates(subset=[id_col_to_check])
+    
+    # Fill NaNs globally
+    gdf['soc_los_t'] = gdf['soc_los_t'].fillna(0)
+    gdf['n_ems_co2e'] = gdf['n_ems_co2e'].fillna(0)
+    
+    if 'biooil_t' not in gdf.columns: gdf['biooil_t'] = 0
+    if 'biogas_t' not in gdf.columns: gdf['biogas_t'] = 0
+    gdf['biooil_t'] = gdf['biooil_t'].fillna(0)
+    gdf['biogas_t'] = gdf['biogas_t'].fillna(0)
+
+    print("--- Calculating Climate Metrics ---")
+    
+    # Constants
+    biooil_substit_effect_coe2_per_ton = 0.4
+    biogas_substit_effect_coe2_per_ton = 0.3
+    carbon_content_of_biochar_in_prod = 0.64
+    carbon_longevity_in_bicohar_in_fields = 0.90 
+    Emission_factor_trucks = 0.00009
+    SAF_product_effect = 0.3
+    SAF_effectivity = 0.75
+    SAF_CO2e_subst_final_effect = 3.1
+    biochar_in_biooil_factor = 0.33
+
+    if scenario_name == 'Heatplants':
+        gdf['tonne_km'] = gdf['bio_in_t'] * gdf['tkm_per_t']
+        gdf['emit_trans_tCO2'] = (gdf['tonne_km'] * Emission_factor_trucks)
+        gdf['char_t'] = gdf['bio_out_t']
+        gdf['sink_tCO2'] = gdf['char_t'] * carbon_content_of_biochar_in_prod * carbon_longevity_in_bicohar_in_fields * CO2_CONVERSION
+        gdf['saf_t'] = gdf['biooil_t'] * SAF_product_effect
+        gdf['effective_saf_t'] = gdf['saf_t'] * SAF_effectivity
+        gdf['avoided_tCO2_saf'] = gdf['effective_saf_t'] * SAF_CO2e_subst_final_effect
+        gdf['avoided_tCO2_fuels'] = gdf['biogas_t'] * biogas_substit_effect_coe2_per_ton
+        
+    elif scenario_name == 'Agri':
+        gdf['tonne_km'] = gdf['bio_out_t'] * gdf['tkm_per_t']
+        gdf['emit_trans_tCO2'] = (gdf['tonne_km'] * Emission_factor_trucks)
+        gdf['char_t'] = gdf['bio_out_t']
+        gdf['sink_tCO2'] = gdf['char_t'] * carbon_content_of_biochar_in_prod * carbon_longevity_in_bicohar_in_fields * CO2_CONVERSION
+        gdf['saf_t'] = gdf['biooil_t'] * SAF_product_effect
+        gdf['effective_saf_t'] = gdf['saf_t'] * SAF_effectivity
+        gdf['avoided_tCO2_saf'] = gdf['effective_saf_t'] * SAF_CO2e_subst_final_effect
+        gdf['avoided_tCO2_fuels'] = gdf['biogas_t'] * biogas_substit_effect_coe2_per_ton
+        
+    elif scenario_name == 'BioOil':
+        gdf['tonne_km'] = gdf['bio_in_t'] * gdf['tkm_per_t']
+        gdf['emit_trans_tCO2'] = gdf['tonne_km'] * Emission_factor_trucks
+        gdf['saf_t'] = gdf['biooil_t'] * SAF_product_effect
+        gdf['effective_saf_t'] = gdf['saf_t'] * SAF_effectivity
+        gdf['avoided_tCO2'] = gdf['effective_saf_t'] * SAF_CO2e_subst_final_effect
+        gdf['char_added_t'] = gdf['bio_out_t'] 
+        gdf['added_sink_tCO2'] = gdf['char_added_t'] * carbon_content_of_biochar_in_prod * carbon_longevity_in_bicohar_in_fields * CO2_CONVERSION
+        gdf['avoided_tCO2_fuels'] = gdf['biogas_t'] * biogas_substit_effect_coe2_per_ton
+    
+    print("--- Calculating Field Emissions based on Plant Inputs ---")
+    SOC_LOSS_TC_PER_TONNE = 0.0533 
+    N_ADDED_KG_PER_TONNE = 6.0 
+    TRACTOR_CO2E_KG_PER_TONNE = 15.0 
+    tot_n_co2e_per_tonne_kg = (N_ADDED_KG_PER_TONNE * 0.01 * 298) + (N_ADDED_KG_PER_TONNE * 3.5) + TRACTOR_CO2E_KG_PER_TONNE
+
+    gdf['emit_soc_tCO2'] = gdf['bio_in_t'] * SOC_LOSS_TC_PER_TONNE * CO2_CONVERSION
+    gdf['emit_n_tCO2'] = (gdf['bio_in_t'] * tot_n_co2e_per_tonne_kg) / 1000.0
+
+    if scenario_name == 'Heatplants':
+        import re
+        hp_multipliers = {1: 0.247, 2: 0.442, 3: 0.430, 4: 0.948, 5: 0.769}
+        def get_mult(val):
+            match = re.search(r'\d+', str(val))
+            return hp_multipliers.get(int(match.group()), 1.0) if match else 1.0
+            
+        gdf['mult'] = gdf[PO8_ID_COL].apply(get_mult)
+        gdf['emit_soc_tCO2'] *= gdf['mult']
+        gdf['emit_n_tCO2'] *= gdf['mult']
+        gdf = gdf.drop(columns=['mult'])
+
+    gdf['total_emit_tCO2'] = gdf['emit_trans_tCO2'] + gdf['emit_soc_tCO2'] + gdf['emit_n_tCO2']
+    
+    prim_col = config['primary_sink_col']
+    sec_col = config.get('secondary_sink_col', 'dummy_sec')
+    tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+
+    if sec_col not in gdf.columns: gdf[sec_col] = 0.0
+    if tert_col not in gdf.columns: gdf[tert_col] = 0.0
+    
+    gdf['net_tCO2'] = gdf['total_emit_tCO2'] - (gdf[prim_col] + gdf[sec_col] + gdf[tert_col])
+    
+    print(f"--- Summarizing totals for {PO8_ID_COL} ---")
+    agg_dict = {
+        'bio_in_t': 'sum',
+        'bio_out_t': 'sum',
+        'emit_trans_tCO2': 'sum',
+        'emit_soc_tCO2': 'sum',
+        'emit_n_tCO2': 'sum',
+        'total_emit_tCO2': 'sum',
+        prim_col: 'sum',
+        sec_col: 'sum',
+        tert_col: 'sum',
+        'net_tCO2': 'sum'
+    }
+    
+    if 'plt_name' in gdf.columns: agg_dict['plt_name'] = 'count'
+    elif 'plant_id' in gdf.columns: agg_dict['plant_id'] = 'count'
+
+    po8_summary = gdf.groupby(PO8_ID_COL).agg(agg_dict).reset_index()
+    if 'plt_name' in po8_summary.columns: po8_summary = po8_summary.rename(columns={'plt_name': 'plant_count'})
+    if 'plant_id' in po8_summary.columns: po8_summary = po8_summary.rename(columns={'plant_id': 'plant_count'})
+
+    po8_summary = po8_summary.sort_values(by='net_tCO2')
+    po8_summary['climate_role'] = po8_summary['net_tCO2'].apply(lambda x: 'Net Sink' if x < 0 else 'Net Source')
+
+    print("--- Saving Data Outputs ---")
+    plant_out = os.path.join(config['data_out'], f'{scenario_name.lower()}_plant_results.xlsx')
+    summary_out = os.path.join(config['data_out'], f'{scenario_name.lower()}_po8_summary.xlsx')
+    spatial_out = os.path.join(config['data_out'], f'{scenario_name.lower()}_final_climate_results.shp')
+
+    gdf.drop(columns='geometry').to_excel(plant_out, index=False)
+    po8_summary.to_excel(summary_out, index=False)
+    
+    id_col_shp = 'plt_name' if 'plt_name' in gdf.columns else 'plant_id'
+    gdf[[PO8_ID_COL, id_col_shp, 'net_tCO2', 'geometry']].copy().to_file(spatial_out)
+
+    generate_plots(scenario_name, po8_summary, config, PO8_ID_COL)
+    print(f"✅ Analysis for {scenario_name} Complete!")
+
+# =================================================================
+# 4. PLOTTING FUNCTION
+# =================================================================
+def generate_plots(scenario_name, po8_summary, config, PO8_ID_COL):
+    print("--- Generating Plots ---")
+    po8_summary = po8_summary.sort_values(by=PO8_ID_COL)
+    prim_col = config['primary_sink_col']
+    sec_col = config.get('secondary_sink_col', 'dummy_sec')
+    tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+
+    if sec_col not in po8_summary.columns: po8_summary[sec_col] = 0.0
+    if tert_col not in po8_summary.columns: po8_summary[tert_col] = 0.0
+    
+    cols_to_numeric = [PO8_ID_COL, 'emit_trans_tCO2', 'emit_soc_tCO2', 'emit_n_tCO2', prim_col, sec_col, tert_col, 'net_tCO2']
+    for col in cols_to_numeric:
+        po8_summary[col] = pd.to_numeric(po8_summary[col], errors='coerce')
+
+    po8_summary = po8_summary.dropna(subset=cols_to_numeric)
+    plot_df = po8_summary[po8_summary[PO8_ID_COL].isin([1, 2, 3, 4, 5])].copy()
+    
+    sns.set_theme(style="whitegrid")
+    
+    color_prim = '#2ecc71' if 'Biochar' in config['primary_sink_label'] else '#3498db'
+    color_sec = '#3498db' if color_prim == '#2ecc71' else '#2ecc71'
+    color_tert = '#9b59b6'
+
+    plot_df[PO8_ID_COL] = plot_df[PO8_ID_COL].astype(str)
+    avg_vals = po8_summary[['emit_trans_tCO2', 'emit_soc_tCO2', 'emit_n_tCO2', prim_col, sec_col, tert_col, 'net_tCO2']].sum() / TOTAL_HECTARES
+
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    ax2 = ax1.twinx() 
+
+    x_regions = [0, 1, 2, 3, 4]
+    x_avg = [5]
+    labels = list(plot_df[PO8_ID_COL]) + ["Total Avg\n(per ha)"]
+
+    ax1.bar(x_regions, plot_df['emit_trans_tCO2'], color='#e74c3c', label='Transport', alpha=0.8, width=0.6)
+    ax1.bar(x_regions, plot_df['emit_soc_tCO2'], bottom=plot_df['emit_trans_tCO2'], color='#d35400', label='SOC Loss', alpha=0.8, width=0.6)
+    ax1.bar(x_regions, plot_df['emit_n_tCO2'], bottom=plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'], color='#f39c12', label='Nitrogen', alpha=0.8, width=0.6)
+    
+    ax1.bar(x_regions, -plot_df[prim_col], color=color_prim, label=config['primary_sink_label'], alpha=0.8, width=0.6)
+    ax1.bar(x_regions, -plot_df[sec_col], bottom=-plot_df[prim_col], color=color_sec, label=config.get('secondary_sink_label', '_nolegend_'), alpha=0.8, width=0.6)
+    ax1.bar(x_regions, -plot_df[tert_col], bottom=-plot_df[prim_col] - plot_df[sec_col], color=color_tert, label=config.get('tertiary_sink_label', '_nolegend_'), alpha=0.8, width=0.6)
+    ax1.scatter(x_regions, plot_df['net_tCO2'], color='black', s=80, label='Net Impact', zorder=5, edgecolor='white')
+
+    ax2.bar(x_avg, [avg_vals['emit_trans_tCO2']], color='#e74c3c', alpha=0.6, width=0.6, hatch='//')
+    ax2.bar(x_avg, [avg_vals['emit_soc_tCO2']], bottom=[avg_vals['emit_trans_tCO2']], color='#d35400', alpha=0.4, width=0.6, hatch='//')
+    ax2.bar(x_avg, [avg_vals['emit_n_tCO2']], bottom=[avg_vals['emit_trans_tCO2'] + avg_vals['emit_soc_tCO2']], color='#f39c12', alpha=0.4, width=0.6, hatch='//')
+    
+    ax2.bar(x_avg, [-avg_vals[prim_col]], color=color_prim, alpha=0.6, width=0.6, hatch='//')
+    ax2.bar(x_avg, [-avg_vals[sec_col]], bottom=[-avg_vals[prim_col]], color=color_sec, alpha=0.6, width=0.6, hatch='//')
+    ax2.bar(x_avg, [-avg_vals[tert_col]], bottom=[-avg_vals[prim_col] - avg_vals[sec_col]], color=color_tert, alpha=0.6, width=0.6, hatch='//')
+    ax2.scatter(x_avg, [avg_vals['net_tCO2']], color='blue', s=120, marker='D', label='Net Avg/ha', zorder=6)
+
+    ax1_min = (-plot_df[prim_col] - plot_df[sec_col] - plot_df[tert_col]).min()
+    ax1_max = (plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'] + plot_df['emit_n_tCO2']).max()
+    ax1_bound = max(abs(ax1_min), abs(ax1_max)) * 1.15  
+    ax1.set_ylim(-ax1_bound, ax1_bound)
+
+    ax2_min = -avg_vals[prim_col] - avg_vals[sec_col] - avg_vals[tert_col]
+    ax2_max = avg_vals['emit_trans_tCO2'] + avg_vals['emit_soc_tCO2'] + avg_vals['emit_n_tCO2']
+    ax2_bound = max(abs(ax2_min), abs(ax2_max)) * 1.6  
+    ax2.set_ylim(-ax2_bound, ax2_bound)
+
+    ax1.axhline(0, color='black', linewidth=1)
+    ax1.set_xticks(range(6))
+    ax1.set_xticklabels(labels, fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Total Regional Impact ($tCO_{2}$)', fontsize=14, color='black')
+    ax2.set_ylabel('Average Intensity ($tCO_{2}$ / hectare)', fontsize=14, color='blue')
+    plt.title(f'{scenario_name} Climate Impact: Regional Totals vs. System Avg/ha', fontsize=16, fontweight='bold', pad=20)
+
+    lines, labels_l = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    
+    by_label = dict(zip(labels_l + labels2, lines + lines2))
+    ax1.legend(by_label.values(), by_label.keys(), loc='upper left', bbox_to_anchor=(1.1, 1), frameon=True)
+    
+    ax1.axvline(4.5, color='gray', linestyle='--', alpha=0.9)
+    plt.tight_layout()
+
+    combined_plot_path = os.path.join(PLOT_OUTPUT_FOLDER, f'{scenario_name.lower()}_combined_regional_avg.png')
+    plt.savefig(combined_plot_path, dpi=400, bbox_inches='tight')
+    plt.close()
+
+# =================================================================
+# 5. COMBINED SCENARIO PLOTTING (A4 Publication Quality)
+# =================================================================
+def generate_combined_all_scenarios_plot():
+    print("\n" + "="*50)
+    print("🌟 GENERATING FINAL COMBINED SCENARIO PLOT 🌟")
+    print("="*50)
+    
+    sns.set_theme(style="whitegrid")
+    
+    fig, ax1 = plt.subplots(figsize=(16, 9))
+    ax2 = ax1.twinx()
+    
+    COLORS = {
+        'Transport': '#D55E00', 
+        'SOC': '#E69F00',       
+        'Nitrogen': '#F0E442',  
+        'Biochar': '#009E73',   
+        'Avoided': '#0072B2',   
+        'FuelSub': '#CC79A7',   
+        'Net': 'black'          
+    }
+    
+    bar_width = 0.245 
+    
+    SCEN_CONFIG = {
+        'Heatplants': {'offset': -0.26, 'hatch': '',    'label': 'HP'},
+        'Agri':       {'offset':  0.00, 'hatch': '//',  'label': 'Ag'},
+        'BioOil':     {'offset':  0.26, 'hatch': 'xx',  'label': 'BO'}
+    }
+    
+    group_centers = np.array([0, 1, 2, 3, 4])  
+    avg_center = 5.5  
+    all_plot_data = []  
+    
+    for scen_name in ['Heatplants', 'Agri', 'BioOil']:
+        config = scenarios[scen_name]
+        summary_path = os.path.join(config['data_out'], f'{scen_name.lower()}_po8_summary.xlsx')
+        
+        if not os.path.exists(summary_path):
+            print(f"⚠️ Warning: Could not find {summary_path}. Run pipeline first.")
+            continue
+            
+        df = pd.read_excel(summary_path)
+        PO8_ID_COL = df.columns[0]
+        
+        df = df.sort_values(by=PO8_ID_COL)
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        df = df.dropna(subset=['emit_trans_tCO2', 'net_tCO2'])
+        plot_df = df[df[PO8_ID_COL].isin([1, 2, 3, 4, 5])].copy()
+        
+        df_for_pkl = df.copy()
+        df_for_pkl['Scenario'] = scen_name
+        all_plot_data.append(df_for_pkl)
+        
+        prim_col = config['primary_sink_col']
+        sec_col = config.get('secondary_sink_col', 'dummy_sec')
+        tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+
+        if sec_col not in df.columns: df[sec_col] = 0.0
+        if tert_col not in df.columns: df[tert_col] = 0.0
+        
+        if 'Biochar' in config['primary_sink_label']:
+            biochar_col, avoided_col = prim_col, sec_col
+        else:
+            biochar_col, avoided_col = sec_col, prim_col
+
+        x_pos = group_centers + SCEN_CONFIG[scen_name]['offset']
+        hatch = SCEN_CONFIG[scen_name]['hatch']
+        
+        ax1.bar(x_pos, plot_df['emit_trans_tCO2'], color=COLORS['Transport'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, plot_df['emit_soc_tCO2'], bottom=plot_df['emit_trans_tCO2'], color=COLORS['SOC'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, plot_df['emit_n_tCO2'], bottom=plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'], color=COLORS['Nitrogen'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        
+        ax1.bar(x_pos, -plot_df[biochar_col], color=COLORS['Biochar'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, -plot_df[avoided_col], bottom=-plot_df[biochar_col], color=COLORS['Avoided'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, -plot_df[tert_col], bottom=-plot_df[biochar_col] - plot_df[avoided_col], color=COLORS['FuelSub'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        
+        ax1.scatter(x_pos, plot_df['net_tCO2'], color=COLORS['Net'], s=60, zorder=5, edgecolor='white')
+        
+        totals_pos = plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'] + plot_df['emit_n_tCO2']
+        for x, y, label in zip(x_pos, totals_pos, [scen_name]*len(x_pos)):
+            ax1.text(x, y + 4000, SCEN_CONFIG[scen_name]['label'], ha='center', va='bottom', rotation=0, fontsize=11, fontweight='bold', color='#2c3e50')
+
+        avg_vals = df[['emit_trans_tCO2', 'emit_soc_tCO2', 'emit_n_tCO2', biochar_col, avoided_col, tert_col, 'net_tCO2']].sum() / TOTAL_HECTARES
+        x_avg_pos = avg_center + SCEN_CONFIG[scen_name]['offset']
+        
+        ax2.bar(x_avg_pos, avg_vals['emit_trans_tCO2'], color=COLORS['Transport'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        ax2.bar(x_avg_pos, avg_vals['emit_soc_tCO2'], bottom=avg_vals['emit_trans_tCO2'], color=COLORS['SOC'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        ax2.bar(x_avg_pos, avg_vals['emit_n_tCO2'], bottom=avg_vals['emit_trans_tCO2'] + avg_vals['emit_soc_tCO2'], color=COLORS['Nitrogen'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        
+        ax2.bar(x_avg_pos, -avg_vals[biochar_col], color=COLORS['Biochar'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        ax2.bar(x_avg_pos, -avg_vals[avoided_col], bottom=-avg_vals[biochar_col], color=COLORS['Avoided'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        ax2.bar(x_avg_pos, -avg_vals[tert_col], bottom=-avg_vals[biochar_col] - avg_vals[avoided_col], color=COLORS['FuelSub'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5, alpha=0.85)
+        
+        ax2.scatter(x_avg_pos, avg_vals['net_tCO2'], color='blue', s=90, marker='D', zorder=6, edgecolor='white')
+        
+        total_pos_avg = avg_vals['emit_trans_tCO2'] + avg_vals['emit_soc_tCO2'] + avg_vals['emit_n_tCO2']
+        ax2.text(x_avg_pos, total_pos_avg + 0.015, SCEN_CONFIG[scen_name]['label'], ha='center', va='bottom', rotation=0, fontsize=11, fontweight='bold', color='blue')
+
+    ax1.set_ylim(-300000, 180000)
+    ax2.set_ylim(-0.75, 0.5)
+
+    ax1.axhline(0, color='black', linewidth=1.5, zorder=0)
+    ax1.axvline(4.75, color='blue', linestyle='--', linewidth=1.5, alpha=0.7)
+
+    all_x_ticks = list(group_centers) + [avg_center]
+    all_x_labels = [f"PR {i}" for i in [1, 2, 3, 4, 5]] + ["Total Average\n(per ha)"]
+    ax1.set_xticks(all_x_ticks)
+    ax1.set_xticklabels(all_x_labels, fontsize=16, fontweight='bold')
+    
+    ax1.set_ylabel('Total Regional Impact ($tCO_{2}$)', fontsize=16, fontweight='bold', color='black')
+    ax2.set_ylabel('Average Intensity ($tCO_{2}$ / hectare)', fontsize=16, fontweight='bold', color='blue')
+    ax1.tick_params(axis='y', labelsize=14)
+    ax2.tick_params(axis='y', labelsize=14)
+
+    plt.title('Comprehensive Climate Impact Across Scenarios (Regional Totals vs. System Avg)', fontsize=20, fontweight='bold', pad=25)
+
+    color_handles = [
+        mpatches.Patch(facecolor=COLORS['Transport'], label='Transport Emissions'),
+        mpatches.Patch(facecolor=COLORS['SOC'], label='SOC Loss Emissions'),
+        mpatches.Patch(facecolor=COLORS['Nitrogen'], label='Nitrogen Emissions'),
+        mpatches.Patch(facecolor=COLORS['Biochar'], label='Biochar Carbon Sink'),
+        mpatches.Patch(facecolor=COLORS['Avoided'], label='Avoided / Substituted (Oil/Gas/SAF)'),
+        mpatches.Patch(facecolor=COLORS['FuelSub'], label='Fuel Substitution (Bio-oil/Gas)'),
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=10, label='Net Regional Impact'),
+        plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='blue', markersize=10, label='Net Avg/ha Impact')
+    ]
+    
+    hatch_handles = [
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='', label='HP: Heatplants'),
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='//', label='Ag: Agri'),
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='xx', label='BO: BioOil')
+    ]
+
+    leg1 = ax1.legend(handles=color_handles, loc='upper left', bbox_to_anchor=(0.01, 0.98), fontsize=12, framealpha=0.9, title="Emission & Sink Categories", title_fontsize=13)
+    leg2 = ax2.legend(handles=hatch_handles, loc='upper left', bbox_to_anchor=(0.25, 0.98), fontsize=12, framealpha=0.9, title="Scenarios", title_fontsize=13)
+    
+    leg1.get_title().set_fontweight('bold')
+    leg2.get_title().set_fontweight('bold')
+
+    plt.tight_layout()
+    output_path = os.path.join(PLOT_OUTPUT_FOLDER, 'A4_Combined_All_Scenarios.png')
+    plt.savefig(output_path, dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Final A4 publication plot saved to:\n{output_path}")
+    
+    if all_plot_data:
+        combined_balance_df = pd.concat(all_plot_data, ignore_index=True)
+        pkl_path = os.path.join(PLOT_OUTPUT_FOLDER, 'annual_climate_balance.pkl')
+        combined_balance_df.to_pickle(pkl_path)
+        print(f"✅ Annual balance results saved to .pkl:\n{pkl_path}")
+
+# =================================================================
+# 6. REGIONAL-ONLY PLOTTING (A4 Publication Quality)
+# =================================================================
+def generate_regional_publication_plot():
+    print("\n" + "="*50)
+    print("🌟 GENERATING FINAL COMBINED SCENARIO PLOT (REGIONAL ONLY) 🌟")
+    print("="*50)
+    
+    sns.set_theme(style="whitegrid")
+    
+    fig, ax1 = plt.subplots(figsize=(16, 9))
+    
+    COLORS = {
+        'Transport': '#D55E00',  
+        'SOC': '#E69F00',        
+        'Nitrogen': '#F0E442',   
+        'Biochar': '#009E73',    
+        'Avoided': '#0072B2',    
+        'FuelSub': '#CC79A7',    
+        'Net': 'black'           
+    }
+    
+    bar_width = 0.245 
+    
+    SCEN_CONFIG = {
+        'Heatplants': {'offset': -0.26, 'hatch': '',    'label': 'HP'},
+        'Agri':       {'offset':  0.00, 'hatch': '//',  'label': 'AG'}, 
+        'BioOil':     {'offset':  0.26, 'hatch': 'xx',  'label': 'BO'}
+    }
+    
+    group_centers = np.array([0, 1, 2, 3, 4])  
+    all_plot_data = []  
+    
+    for scen_name in ['Heatplants', 'Agri', 'BioOil']:
+        config = scenarios[scen_name]
+        summary_path = os.path.join(config['data_out'], f'{scen_name.lower()}_po8_summary.xlsx')
+        
+        if not os.path.exists(summary_path):
+            print(f"⚠️ Warning: Could not find {summary_path}. Run pipeline first.")
+            continue
+            
+        df = pd.read_excel(summary_path)
+        PO8_ID_COL = df.columns[0]
+        
+        df = df.sort_values(by=PO8_ID_COL)
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+        df = df.dropna(subset=['emit_trans_tCO2', 'net_tCO2'])
+        plot_df = df[df[PO8_ID_COL].isin([1, 2, 3, 4, 5])].copy()
+        
+        df_for_pkl = df.copy()
+        df_for_pkl['Scenario'] = scen_name
+        all_plot_data.append(df_for_pkl)
+        
+        prim_col = config['primary_sink_col']
+        sec_col = config.get('secondary_sink_col', 'dummy_sec')
+        tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+
+        if sec_col not in df.columns: df[sec_col] = 0.0
+        if tert_col not in df.columns: df[tert_col] = 0.0
+        
+        if 'Biochar' in config['primary_sink_label']:
+            biochar_col, avoided_col = prim_col, sec_col
+        else:
+            biochar_col, avoided_col = sec_col, prim_col
+
+        x_pos = group_centers + SCEN_CONFIG[scen_name]['offset']
+        hatch = SCEN_CONFIG[scen_name]['hatch']
+        
+        ax1.bar(x_pos, plot_df['emit_trans_tCO2'], color=COLORS['Transport'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, plot_df['emit_soc_tCO2'], bottom=plot_df['emit_trans_tCO2'], color=COLORS['SOC'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, plot_df['emit_n_tCO2'], bottom=plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'], color=COLORS['Nitrogen'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        
+        ax1.bar(x_pos, -plot_df[biochar_col], color=COLORS['Biochar'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, -plot_df[avoided_col], bottom=-plot_df[biochar_col], color=COLORS['Avoided'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        ax1.bar(x_pos, -plot_df[tert_col], bottom=-plot_df[biochar_col] - plot_df[avoided_col], color=COLORS['FuelSub'], width=bar_width, hatch=hatch, edgecolor='white', linewidth=0.5)
+        
+        ax1.scatter(x_pos, plot_df['net_tCO2'], color=COLORS['Net'], s=80, zorder=5, edgecolor='white')
+        
+        totals_pos = plot_df['emit_trans_tCO2'] + plot_df['emit_soc_tCO2'] + plot_df['emit_n_tCO2']
+        for x, y, label in zip(x_pos, totals_pos, [scen_name]*len(x_pos)):
+            ax1.text(x, y + 5000, SCEN_CONFIG[scen_name]['label'], ha='center', va='bottom', rotation=0, fontsize=14, fontweight='bold', color='#2c3e50')
+
+    ax1.set_ylim(-450000, 229000)
+    ax1.axhline(0, color='black', linewidth=1.5, zorder=0)
+
+    ax1.set_xticks(group_centers)
+    ax1.set_xticklabels([f"PR {i}" for i in [1, 2, 3, 4, 5]], fontsize=18, fontweight='bold')
+    
+    ax1.set_ylabel('Total Regional Impact ($tCO_{2}$)', fontsize=20, fontweight='bold', color='black', labelpad=15)
+    ax1.tick_params(axis='y', labelsize=16)
+
+    plt.title('Climate Impact [CO2eq] Across Scenarios', fontsize=24, fontweight='bold', pad=25)
+
+    color_handles = [
+        mpatches.Patch(facecolor=COLORS['Transport'], label='Transport Emissions '),
+        mpatches.Patch(facecolor=COLORS['SOC'], label='SOC Loss Emissions'),
+        mpatches.Patch(facecolor=COLORS['Nitrogen'], label='Nitrogen Emissions'),
+        mpatches.Patch(facecolor=COLORS['Biochar'], label='Biochar C Sink'),
+        mpatches.Patch(facecolor=COLORS['Avoided'], label='Feedstock substitution (SAF)'),
+        mpatches.Patch(facecolor=COLORS['FuelSub'], label='Fuel substitution (Fossil source)')
+    ]
+    
+    fig.legend(handles=color_handles, loc='lower center', bbox_to_anchor=(0.5, 0.09), 
+               ncol=3, fontsize=18, frameon=False)
+    
+    inside_handles = [
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=12, label='Net Regional Impact'),
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='', label='HP: Heatplants'),
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='//', label='AG: Agri'),
+        mpatches.Patch(facecolor='white', edgecolor='black', hatch='xx', label='BO: BioOil')
+    ]
+    
+    ax1.legend(handles=inside_handles, loc='upper left', fontsize=13, frameon=True, framealpha=0.95)
+
+    plt.subplots_adjust(bottom=0.25)
+
+    output_dir = r'<INSERT_REGIONAL_PLOT_DIR_HERE>'
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'A4_Combined_All_Scenarios_Regional_Only.png')
+    
+    plt.savefig(output_path, dpi=600, bbox_inches='tight')
+    plt.close()
+    print(f"✅ Final A4 publication plot saved to:\n{output_path}")
+    
+    if all_plot_data:
+        combined_balance_df = pd.concat(all_plot_data, ignore_index=True)
+        pkl_path = os.path.join(output_dir, 'annual_climate_balance.pkl')
+        combined_balance_df.to_pickle(pkl_path)
+        print(f"✅ Annual balance results saved to .pkl:\n{pkl_path}")
+
+# =================================================================
+# 7. PRINT HARD VALUES FOR ARTICLE WRITING
+# =================================================================
+def print_hard_values_for_article():
+    print("\n" + "="*60)
+    print("📊 HARD VALUES FOR ARTICLE WRITING (PR 1-5) 📊")
+    print("="*60)
+    
+    for scen_name in ['Heatplants', 'Agri', 'BioOil']:
+        print(f"\n" + "-"*40)
+        print(f"🚀 SCENARIO: {scen_name.upper()}")
+        print("-"*40)
+        
+        config = scenarios[scen_name]
+        summary_path = os.path.join(config['data_out'], f'{scen_name.lower()}_po8_summary.xlsx')
+        
+        if not os.path.exists(summary_path):
+            print(f"⚠️ Data file not found: {summary_path}")
+            continue
+            
+        df = pd.read_excel(summary_path)
+        PO8_ID_COL = df.columns[0]
+        
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['emit_trans_tCO2', 'net_tCO2'])
+        df = df[df[PO8_ID_COL].isin([1, 2, 3, 4, 5])].copy()
+        
+        print("\nNET IMPACT PER REGION (tCO2eq):")
+        for _, row in df.iterrows():
+            print(f"     PR {int(row[PO8_ID_COL])}: {row['net_tCO2']:,.0f}")
+            
+        print("\n  2. TOTAL IMPACTS ACROSS ALL 5 REGIONS (tCO2eq):")
+        
+        trans = df['emit_trans_tCO2'].sum()
+        soc = df['emit_soc_tCO2'].sum()
+        n_ems = df['emit_n_tCO2'].sum()
+        net = df['net_tCO2'].sum()
+        
+        prim_col = config['primary_sink_col']
+        sec_col = config.get('secondary_sink_col', 'dummy_sec')
+        tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+        
+        prim_val = df[prim_col].sum() if prim_col in df.columns else 0
+        sec_val = df[sec_col].sum() if sec_col in df.columns else 0
+        tert_val = df[tert_col].sum() if tert_col in df.columns else 0
+        
+        print(f"     [+] Total Transport Emissions:     {trans:,.0f}")
+        print(f"     [+] Total SOC Loss Emissions:      {soc:,.0f}")
+        print(f"     [+] Total Nitrogen Emissions:      {n_ems:,.0f}")
+        print(f"     [-] Total {config['primary_sink_label']}: {-prim_val:,.0f}")
+        
+        if 'secondary_sink_label' in config:
+            print(f"     [-] Total {config['secondary_sink_label']}: {-sec_val:,.0f}")
+        if 'tertiary_sink_label' in config:
+            print(f"     [-] Total {config['tertiary_sink_label']}: {-tert_val:,.0f}")
+        
+        print("     " + "="*35)
+        print(f"     TOTAL REGIONAL NET BALANCE:        {net:,.0f}\n")
+
+# =================================================================
+# 8. EXPORT FULL SECTORAL ANALYSIS TO EXCEL
+# =================================================================
+def export_sectoral_analysis_excel():
+    print("\n" + "="*60)
+    print("📁 EXPORTING FULL SECTORAL ANALYSIS TO EXCEL 📁")
+    print("="*60)
+    
+    output_dir = r'<INSERT_SECTORAL_OUTPUT_DIR_HERE>'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    all_data = []
+    
+    for scen_name in ['Heatplants', 'Agri', 'BioOil']:
+        config = scenarios[scen_name]
+        summary_path = os.path.join(config['data_out'], f'{scen_name.lower()}_po8_summary.xlsx')
+        
+        if not os.path.exists(summary_path):
+            print(f"⚠️ Data file not found for {scen_name}: {summary_path}")
+            continue
+            
+        df = pd.read_excel(summary_path)
+        PO8_ID_COL = df.columns[0]
+        
+        for col in df.columns[1:]:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['emit_trans_tCO2', 'net_tCO2'])
+        df = df[df[PO8_ID_COL].isin([1, 2, 3, 4, 5])].copy()
+        
+        prim_col = config['primary_sink_col']
+        sec_col = config.get('secondary_sink_col', 'dummy_sec')
+        tert_col = config.get('tertiary_sink_col', 'dummy_tert')
+        
+        for col in [prim_col, sec_col, tert_col]:
+            if col not in df.columns:
+                df[col] = 0.0
+                
+        if 'Biochar' in config['primary_sink_label']:
+            biochar_col, saf_col = prim_col, sec_col
+        else:
+            biochar_col, saf_col = sec_col, prim_col
+            
+        clean_df = pd.DataFrame({
+            'Scenario': scen_name,
+            'Production_Region_PR': df[PO8_ID_COL].astype(int).astype(str),
+            'Transport_Emissions_tCO2 (+)': df['emit_trans_tCO2'],
+            'SOC_Loss_Emissions_tCO2 (+)': df['emit_soc_tCO2'],
+            'Nitrogen_Emissions_tCO2 (+)': df['emit_n_tCO2'],
+            'Biochar_Sink_tCO2 (-)': -df[biochar_col],
+            'SAF_Substitution_tCO2 (-)': -df[saf_col],
+            'Fuel_Substitution_tCO2 (-)': -df[tert_col],
+            'Net_Balance_tCO2': df['net_tCO2']
+        })
+        
+        all_data.append(clean_df)
+        
+    if all_data:
+        final_df = pd.concat(all_data, ignore_index=True)
+        totals_df = final_df.groupby('Scenario').sum(numeric_only=True).reset_index()
+        totals_df['Production_Region_PR'] = 'ALL (Total)'
+        
+        final_df = pd.concat([final_df, totals_df], ignore_index=True)
+        final_df['sort_key'] = final_df['Production_Region_PR'].apply(lambda x: 999 if x == 'ALL (Total)' else int(x))
+        final_df = final_df.sort_values(by=['Scenario', 'sort_key']).drop(columns=['sort_key'])
+        
+        output_path = os.path.join(output_dir, 'Sectoral_Analysis_Full_Balance.xlsx')
+        final_df.to_excel(output_path, index=False)
+        print(f"✅ Successfully saved full sectoral data to:\n{output_path}")
+    else:
+        print("❌ No data found to export.")
+
+# =================================================================
+# 9. PRINT BIOMASS DIAGNOSTICS
+# =================================================================
+def print_biomass_diagnostics():
+    print("\n" + "="*70)
+    print("🕵️ BIOMASS EXTRACTION DIAGNOSTICS: MODEL VS REALITY (PR 1-5) 🕵️")
+    print("="*70)
+    
+    for scen_name in ['Heatplants', 'Agri', 'BioOil']:
+        print(f"\n--- {scen_name.upper()} SCENARIO ---")
+        config = scenarios[scen_name]
+        summary_path = os.path.join(config['data_out'], f'{scen_name.lower()}_po8_summary.xlsx')
+        
+        if not os.path.exists(summary_path):
+            print(f"⚠️ No data found at {summary_path}")
+            continue
+            
+        df = pd.read_excel(summary_path)
+        PO8_ID_COL = df.columns[0]
+        
+        df = df.dropna(subset=[PO8_ID_COL])
+        df = df[df[PO8_ID_COL].isin([1, 2, 3, 4, 5])].sort_values(by=PO8_ID_COL)
+        
+        print(f"{'PR':<4} | {'Plant Input (bio_in_t)':<25} | {'Field Harvest (actual_field_harvest_t)':<35}")
+        print("-" * 75)
+        
+        for _, row in df.iterrows():
+            pr = int(row[PO8_ID_COL])
+            bio_in = row.get('bio_in_t', 0)
+            harvested = row.get('actual_field_harvest_t', 0)
+            print(f"PR {pr:<2} | {bio_in:<25,.0f} | {harvested:<35,.0f}")
+
+# =================================================================
+# EXECUTE FULL PIPELINE
+# =================================================================
+if __name__ == "__main__":
+    print("--- Loading Global PO8 Shapefile ---")
+    po8 = gpd.read_file(PO8_SHP_PATH)
+    
+    # 1. Run Core Analysis for each scenario
+    for scenario_name, config in scenarios.items():
+        run_scenario_analysis(scenario_name, config, po8)
+        
+    # 2. Generate Master Plots
+    generate_combined_all_scenarios_plot()
+    generate_regional_publication_plot()
+    
+    # 3. Diagnostics & Exports
+    print_hard_values_for_article()
+    export_sectoral_analysis_excel()
+    print_biomass_diagnostics()
+    
+    print("\n🎉 ALL SCENARIOS AND MASTER PLOTS SUCCESSFULLY GENERATED! 🎉")

@@ -1,0 +1,297 @@
+# ============================================================
+# AGRI SCENARIO — SECOND ANALYSIS (SOC + N + PLOTS)
+# ============================================================
+
+import geopandas as gpd
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import os
+
+# -------------------------------
+# 1. PATHS
+# -------------------------------
+# Set your local or repository base directory here
+base_path = r"<INSERT_BASE_DIRECTORY_PATH_HERE>"
+
+plants_fp = f"{base_path}/plants_with_logistics.shp"
+flows_fp = f"{base_path}/flows_with_logistics.csv"
+
+output_folder = f"{base_path}/analysis_outputs"
+os.makedirs(output_folder, exist_ok=True)
+
+# -------------------------------
+# 2. LOAD DATA
+# -------------------------------
+print("Loading data...")
+plants = gpd.read_file(plants_fp)
+flows = pd.read_csv(flows_fp)
+
+# -------------------------------
+# 3. CLEAN COLUMN NAMES (IMPORTANT)
+# -------------------------------
+plants = plants.rename(columns={
+    'bio_in_t': 'biomass_input_t',
+    'bio_out_t': 'biochar_output_t',
+    'oil_out_t': 'biooil_output_t', 
+    'gas_out_t': 'biogas_output_t', 
+    'ref_km': 'refinery_km',            
+    'oil_tkm': 'oil_tkm',
+    'avg_km': 'avg_dist_km',
+    'tkm_per_t': 'intensity_tkm_per_t', 
+    'tot_tkm': 'total_tkm',   
+    'road_tkm': 'total_tkm'
+})
+
+# -------------------------------
+# 4. SOC + NITROGEN CALCULATIONS
+# -------------------------------
+print("Calculating SOC and Nitrogen emissions...")
+
+# --- AREA ESTIMATION ---
+# Adjust yields and loss factors based on your local case study context
+AVG_YIELD_T_HA = 3.0
+plants["est_area_ha"] = plants["biomass_input_t"] / AVG_YIELD_T_HA
+
+# --- SOC LOSS ---
+SOC_LOSS_PER_HA = 0.160
+plants["soc_loss_t"] = plants["est_area_ha"] * SOC_LOSS_PER_HA
+
+# --- NITROGEN EMISSIONS ---
+N_ADDED_KG_PER_HA = 6 * AVG_YIELD_T_HA
+N_DIRECT_EMISSIONS_FACTOR = 0.01
+N_PROD_EMISSIONS_CO2E_PER_KG = 3.5
+TRACTOR_EMISSION_CO2E_PER_HA = 45.0
+N2O_GWP = 298
+
+n_dir = (N_ADDED_KG_PER_HA * N_DIRECT_EMISSIONS_FACTOR * N2O_GWP)
+n_prod = (N_ADDED_KG_PER_HA * N_PROD_EMISSIONS_CO2E_PER_KG)
+tot_n_co2e_per_ha_kg = n_dir + n_prod + TRACTOR_EMISSION_CO2E_PER_HA
+
+plants["n_emiss_t_co2e"] = (plants["est_area_ha"] * tot_n_co2e_per_ha_kg) / 1000
+
+# -------------------------------
+# 5. BASIC SYSTEM STATS
+# -------------------------------
+print("\n=== SYSTEM SUMMARY ===")
+
+total_biomass = plants["biomass_input_t"].sum()
+total_soc = plants["soc_loss_t"].sum()
+total_n = plants["n_emiss_t_co2e"].sum()
+
+print(f"Total biomass used: {total_biomass:,.0f} t")
+print(f"Total SOC loss: {total_soc:,.0f} t")
+print(f"Total Nitrogen emissions: {total_n:,.0f} t CO2e")
+
+# -------------------------------
+# 6. FINAL 4-PANEL FIGURE
+# -------------------------------
+print("\nGenerating final plots...")
+
+sns.set_theme(style="whitegrid")
+
+df = plants.copy()
+
+# Remove zero plants
+df = df[df["biomass_input_t"] > 0]
+
+# Cap outliers
+df["biomass_input_t"] = df["biomass_input_t"].clip(
+    upper=df["biomass_input_t"].quantile(0.98)
+)
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+# A. Distance vs Biomass
+sns.scatterplot(
+    data=df, x="avg_dist_km", y="biomass_input_t",
+    size="biomass_input_t", sizes=(30, 300),
+    alpha=0.6, ax=axes[0, 0]
+)
+axes[0, 0].set_title("A. Distance vs Biomass Intake")
+
+# B. Distance vs Biochar Output
+sns.scatterplot(
+    data=df, x="avg_dist_km", y="biochar_output_t",
+    size="biochar_output_t", sizes=(30, 300),
+    alpha=0.6, ax=axes[0, 1]
+)
+axes[0, 1].set_title("B. Distance vs Biochar Output")
+
+# C. Distance vs SOC Loss
+sns.scatterplot(
+    data=df, x="avg_dist_km", y="soc_loss_t",
+    size="biomass_input_t", sizes=(30, 300),
+    alpha=0.6, ax=axes[1, 0]
+)
+axes[1, 0].set_title("C. Distance vs SOC Loss")
+
+# D. Distance vs Nitrogen
+sns.scatterplot(
+    data=df, x="avg_dist_km", y="n_emiss_t_co2e",
+    size="biomass_input_t", sizes=(30, 300),
+    alpha=0.6, ax=axes[1, 1]
+)
+axes[1, 1].set_title("D. Distance vs Nitrogen Emissions")
+
+for ax in axes.flat:
+    ax.set_xlabel("Average Distance (km)")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+plt.tight_layout()
+
+plot_path = f"{output_folder}/agri_distance_analysis.png"
+plt.savefig(plot_path, dpi=400)
+plt.close()
+
+print(f"✅ Plot saved: {plot_path}")
+
+# -------------------------------
+# 7. EXPORT (EXCEL + SHAPEFILE)
+# -------------------------------
+print("\nExporting results...")
+
+# Excel
+excel_out = plants[[
+    "plant_id",
+    "biomass_input_t",
+    "biochar_output_t",
+    "biooil_output_t",  
+    "biogas_output_t",  
+    "avg_dist_km",
+    "refinery_km",          
+    "intensity_tkm_per_t",  
+    "oil_tkm",              
+    "soc_loss_t",
+    "total_tkm",            
+    "n_emiss_t_co2e"
+]].copy()
+
+excel_out.columns = [
+    "Plant ID",
+    "Biomass Input (t)",
+    "Biochar Output (t)",
+    "Bio-oil Output (t)", 
+    "Biogas Output (t)",  
+    "Distance to Refinery (km)",         
+    "Transport Intensity (tkm/t)", 
+    "Bio-oil Transport (tkm)",     
+    "Total System Transport (tkm)",
+    "Avg Distance (km)",
+    "SOC Loss (t)",
+    "Nitrogen Emissions (t CO2e)"
+]
+
+excel_out.to_excel(f"{output_folder}/agri_climate_accounting.xlsx", index=False)
+
+# Shapefile (short names!)
+plants_export = plants.copy()
+
+plants_export = plants_export.rename(columns={
+    "soc_loss_t": "soc_los_t",
+    "n_emiss_t_co2e": "n_ems_co2e",
+    "biomass_input_t": "bio_in_t",
+    "biooil_output_t": "oil_out_t", 
+    "biogas_output_t": "gas_out_t",  
+    "biochar_output_t": "bio_out_t",
+    "intensity_tkm_per_t": "tkm_per_t", 
+    "refinery_km": "ref_km",      
+    "total_tkm": "road_tkm",
+    "oil_tkm": "oil_tkm"                 
+})
+
+plants_export.to_file(f"{output_folder}/agri_climate_accounting.shp")
+
+print("✅ Exports complete.")
+
+print("\nCHECKING DATA")
+print(f"Total biomassa in (Agri): {plants['biomass_input_t'].sum():,.0f} t")
+
+# -------------------------------
+# 8. REGIONAL BIOMASS EXTRACTION SUMMARY (AREA-WEIGHTED FIX)
+# -------------------------------
+print("\n=== REGIONAL BIOMASS EXTRACTION SUMMARY ===")
+
+# Paths to the field shapefile (using the agri base_path) and the regional borders
+FIELD_STATUS_SHP = f"{base_path}/field_utilization_status_agri.shp"
+PO8_SHP_PATH = r'<INSERT_REGIONAL_BOUNDARIES_SHAPEFILE_PATH_HERE>'
+
+if os.path.exists(FIELD_STATUS_SHP) and os.path.exists(PO8_SHP_PATH):
+    print("Loading field status and regional borders...")
+    fields_gdf = gpd.read_file(FIELD_STATUS_SHP)
+    po8_gdf = gpd.read_file(PO8_SHP_PATH)
+    
+    # Ensure standard projected CRS for accurate area math (e.g., SWEREF 99 TM "EPSG:3006" for Sweden)
+    # Adjust target_crs to match your specific geographic context
+    target_crs = "EPSG:3006" 
+    fields_gdf = fields_gdf.to_crs(target_crs)
+    po8_gdf = po8_gdf.to_crs(target_crs)
+        
+    print("Performing area-weighted spatial intersection...")
+    
+    # Identify the region column
+    possible_cols = [c for c in po8_gdf.columns if any(x in c.upper() for x in ['PO', 'PROD', 'NAMN', 'NAME'])]
+    REGION_COL = possible_cols[0] if possible_cols else 'PR_ID'
+
+    # 1. Calculate the original area of the polygons
+    fields_gdf['orig_area'] = fields_gdf.geometry.area
+    
+    # 2. Geometrically intersect polygons (this physically slices them along region borders)
+    po8_subset = po8_gdf[[REGION_COL, 'geometry']]
+    intersected = gpd.overlay(fields_gdf, po8_subset, how='intersection')
+    
+    # 3. Calculate the new area of the sliced pieces
+    intersected['split_area'] = intersected.geometry.area
+    
+    # 4. Calculate what proportion of the original polygon ended up in each slice
+    intersected['area_prop'] = intersected['split_area'] / intersected['orig_area']
+
+    print("Distributing biomass proportionally to regions...")
+    
+    # 5. Multiply the biomass totals by the proportion that falls into each region
+    for col in ['orig_bio_t', 'used_bio_t', 'leftover_t']:
+        if col in intersected.columns:
+            intersected[col] = intersected[col].fillna(0) * intersected['area_prop']
+
+    print("Summarizing totals per region...")
+    
+    # 6. Group by Region and sum the newly weighted values
+    regional_summary = intersected.groupby(REGION_COL).agg({
+        'orig_bio_t': 'sum',      
+        'used_bio_t': 'sum',      
+        'leftover_t': 'sum'       
+    }).reset_index()
+
+    # Calculate actual percentages
+    regional_summary['Extraction_Rate_%'] = (regional_summary['used_bio_t'] / regional_summary['orig_bio_t'] * 100).fillna(0).round(1)
+    regional_summary['Stranded_Rate_%'] = (regional_summary['leftover_t'] / regional_summary['orig_bio_t'] * 100).fillna(0).round(1)
+
+    # Clean up column names for the final output
+    regional_summary = regional_summary.rename(columns={
+        REGION_COL: 'Region',
+        'orig_bio_t': 'Total Potential (t)',
+        'used_bio_t': 'Extracted Biomass (t)',
+        'leftover_t': 'Stranded Biomass (t)'
+    })
+
+    # Sort to show highest potential regions first
+    regional_summary = regional_summary.sort_values(by='Total Potential (t)', ascending=False)
+
+    print("\nRegional Extraction Breakdown:")
+    # Using format to make the printout cleaner
+    print(regional_summary.to_string(index=False, float_format="{:,.1f}".format))
+
+    reg_summary_fp = f"{output_folder}/agri_regional_extraction_summary.csv"
+    regional_summary.to_csv(reg_summary_fp, index=False)
+    print(f"\n✅ Regional summary saved to:\n{reg_summary_fp}")
+    
+    # Optional check to verify total sums match
+    check_total = regional_summary['Total Potential (t)'].sum()
+    print(f"\nVerification - Distributed National Total Potential: {check_total:,.0f} t")
+
+else:
+    print(f"⚠️ Could not find required shapefiles. Check paths:\n{FIELD_STATUS_SHP}\n{PO8_SHP_PATH}")
+
+print("\n🎉 SCRIPT COMPLETE! 🎉")
