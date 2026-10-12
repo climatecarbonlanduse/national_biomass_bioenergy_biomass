@@ -1,0 +1,848 @@
+import geopandas as gpd
+import networkx as nx
+import pandas as pd
+from shapely.geometry import Point
+from scipy.spatial import cKDTree
+from tqdm import tqdm
+import warnings
+import numpy as np
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+warnings.filterwarnings("ignore")
+
+
+def build_network_graph(gdf, graph, weight_multiplier=1.0, net_type='road'):
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf), desc=f"Building {net_type} network"):
+        geom = row.geometry
+        if geom is None:
+            continue
+
+        lines = [geom] if geom.geom_type == 'LineString' else (
+            geom.geoms if geom.geom_type == 'MultiLineString' else []
+        )
+
+        for line in lines:
+            coords = list(line.coords)
+            start_node = coords[0]
+            end_node = coords[-1]
+            weight = line.length * weight_multiplier
+            graph.add_edge(start_node, end_node, weight=weight, type=net_type)
+
+    return graph
+
+
+def main():
+    print("1. Loading Shapefiles...")
+    # Set your local or repository paths here
+    base_path = r'<INSERT_BASE_INPUT_DIRECTORY_HERE>'
+    out_path = r'<INSERT_OUTPUT_DIRECTORY_HERE>'
+    refinery_path = r'<INSERT_REFINERY_SCENARIO_DIRECTORY_HERE>'
+
+    polygons = gpd.read_file(f'{base_path}/merged/skordeomrade_halm_stats.shp')
+    
+    # ADD THIS LINE TO FIX THE INDEXING BUG:
+    polygons = polygons.reset_index(drop=True)
+    
+    # Input for heating plants
+    mills = gpd.read_file(r'<INSERT_HEATING_PLANTS_SHAPEFILE_PATH_HERE>')
+    
+    # --- ADD REFINERY HERE ---
+    refinery = gpd.read_file(f'{refinery_path}/raff_location.shp')
+    
+    roads = gpd.read_file(f'{base_path}/roads/Road_Network_Merged.shp')
+    rails = gpd.read_file(f'{base_path}/railroad/railroads.shp')
+    stations = gpd.read_file(f'{base_path}/railroad/tagstationer.shp')
+
+    # Set target CRS for accurate distance calculations (e.g., EPSG:3006 for SWEREF 99 TM)
+    target_crs = "<SET_TARGET_CRS_HERE>"
+    polygons = polygons.to_crs(target_crs)
+    mills = mills.to_crs(target_crs)
+    roads = roads.to_crs(target_crs)
+    rails = rails.to_crs(target_crs)
+
+    print("2. Aligning Coordinate Reference Systems (CRS)...")
+    stations = stations.to_crs(target_crs)
+    # --- ADD REFINERY CRS HERE ---
+    refinery = refinery.to_crs(target_crs)
+
+    print("3. Loading Biomass and Calculating Potentials...")
+    
+    dry_weight_factor = 1
+
+    # Sensitivity modifier (e.g., 0.8, 1.0, 1.2)
+    sensitive_biochar = 1
+
+    # Base conversion yields
+    base_biochar = 0.10
+    base_biooil = 0.05
+    base_biogas = 0.80
+
+    # Substitution factors
+    Biooil_subs_factor_ = 0.50
+    Biogas_subs_Factor = 1
+
+    # Apply sensitivity to biochar
+    biochar_conversion_factor = base_biochar * sensitive_biochar
+
+    # Mass balance closure
+    remaining_mass = 1.0 - biochar_conversion_factor
+
+    # Redistribute remaining mass according to the original proportions
+    biooil_share = base_biooil / (base_biooil + base_biogas)
+    biogas_share = base_biogas / (base_biooil + base_biogas)
+
+    biooil_conversion_factor = remaining_mass * biooil_share * Biooil_subs_factor_
+    biogas_conversion_factor = remaining_mass * biogas_share * Biogas_subs_Factor
+        
+    # Remove commas and convert to numeric
+    polygons['Region pot'] = polygons['Region pot'].astype(str).str.replace(',', '').astype(float)
+
+    polygons['biomass_t'] = polygons['Region pot'] * dry_weight_factor
+    polygons['biochar_pot'] = polygons['biomass_t'] * biochar_conversion_factor
+    
+    print("4. Building the Master Transportation Graph...")
+    G = nx.Graph()
+    G = build_network_graph(roads, G, weight_multiplier=1.0, net_type='road')
+  
+    network_nodes = list(G.nodes())
+    tree = cKDTree(network_nodes)
+    
+    polygons['net_node'] = polygons.geometry.centroid.apply(
+            lambda g: network_nodes[tree.query((g.x, g.y))[1]]
+        )
+
+    mills['net_node'] = mills.geometry.apply(
+            lambda g: network_nodes[tree.query((g.x, g.y))[1]]
+        )
+
+    print("6. Snapping Geometries to Network...")
+    poly_nodes = {}
+    for idx, geom in polygons.geometry.items():
+        centroid = geom.centroid
+        _, nearest_idx = tree.query((centroid.x, centroid.y))
+        poly_nodes[idx] = network_nodes[nearest_idx]
+        
+    # --- ADD REFINERY SNAPPING HERE ---
+    refinery['net_node'] = refinery.geometry.centroid.apply(
+            lambda g: network_nodes[tree.query((g.x, g.y))[1]]
+        )
+
+    # ---------- STEP 8: SNAPPING & ROUTING (UPDATED CAPACITY LOGIC) ----------
+    print("8. Snapping Locations and Calculating Routing with MW-based Capacity...")
+
+    mill_id_col = 'id' if 'id' in mills.columns else mills.columns[0]
+    biomass_conversion_factor = 1        # PELLET
+    
+    Sensitivity_for_size = 1
+    
+    tonnes_per_mw = <SET_TONNES_PER_MW_HERE> * Sensitivity_for_size  # e.g., 207
+
+    mill_data = {}
+
+    for _, row in mills.iterrows():
+        mill_pt = (row.geometry.x, row.geometry.y)
+        _, nearest_idx = tree.query(mill_pt)
+        net_node = network_nodes[nearest_idx]
+        m_id = row[mill_id_col]
+
+        # --- NEW CAPACITY LOGIC ---
+        # 1. Get values, defaulting to 0 if they are NaN or missing
+        h_cap = float(row.get('heat_cap', 0) or 0)
+        b_net = float(row.get('block_net', 0) or 0)
+        s_cap = float(row.get('steam_cap', 0) or 0)
+        
+        # 2. Determine base capacity (using max of heat or steam since they are rarely concurrent)
+        base_cap = max(h_cap, s_cap)
+        
+        # 3. Apply formula: (Base + 50% of Block Net) * 50% duty cycle
+        effective_mw = (base_cap + (0.5 * b_net)) * 0.5
+        
+        # 4. Convert MW to annual tonnes of DM straw
+        annual_demand = effective_mw * tonnes_per_mw
+
+        mill_data[m_id] = {
+            'node': net_node,
+            'capacity_left': annual_demand,
+            'total_capacity': annual_demand, # Store this for utilization % later
+            'taken_bc': 0.0
+        }
+
+    # ---------- STEP 9: COMPETITIVE ALLOCATION (COST-BASED) ----------
+    print("9. Allocating Biomass: Limit + Cost-based weighting...")
+    
+    import numpy as np
+
+    mill_distances = {}
+    
+    sensitivity_for_distance = 1
+    
+    distance_limit = <SET_MAX_CATCHMENT_METERS_HERE> * sensitivity_for_distance  # e.g., 100000
+
+    # 1. Faster Dijkstra with Cutoff
+    for m_id, m_info in tqdm(mill_data.items(), desc="Computing distances from mills"):
+        source_node = m_info['node']
+        # Stop searching at limit to prevent "freezing" on national-scale networks
+        lengths = nx.single_source_dijkstra_path_length(G, source_node, cutoff=distance_limit, weight='weight')
+        mill_distances[m_id] = lengths
+
+    # 2. Map network nodes to eligible mills (Speed optimization)
+    node_to_mills = {}
+    for m_id, distances in mill_distances.items():
+        for node, dist in distances.items():
+            if node not in node_to_mills:
+                node_to_mills[node] = []
+            node_to_mills[node].append((dist, m_id))
+    
+    valid_polygons = polygons[polygons['biomass_t'] > 0].copy()
+    mill_flows = []
+
+    # 3. Allocation Loop
+    for p_idx, poly_row in tqdm(valid_polygons.iterrows(), total=len(valid_polygons), desc="Distributing Biomass"):
+        
+        current_biomass = poly_row['biomass_t']
+        if current_biomass <= 0.01: # Epsilon check
+            continue
+            
+        poly_node = poly_nodes[p_idx]
+        all_potential_mills = node_to_mills.get(poly_node, [])
+        
+        # Filter for capacity
+        eligible_mills = [
+            (dist, m_id) for dist, m_id in all_potential_mills 
+            if mill_data[m_id]['capacity_left'] > 0.01
+        ]
+
+        if not eligible_mills:
+            continue
+
+        # Limit competition to closest 3 (to represent market reality)
+        eligible_mills = sorted(eligible_mills, key=lambda x: x[0])[:3]
+
+        # --- Your Cost-based weighting parameters ---
+        transport_cost_per_km = 0.5
+        beta = 0.15
+
+        # Iterative allocation within the polygon
+        remaining_biomass = current_biomass
+        
+        while remaining_biomass > 0.01 and eligible_mills:
+            weights = []
+            for dist_fm, m_id in eligible_mills:
+                dist_km = dist_fm / 1000
+                cost = dist_km * transport_cost_per_km
+                decay = np.exp(-dist_km / 50)
+                weight = np.exp(-beta * cost) * decay
+                weights.append((weight, m_id, dist_fm))
+
+            total_weight = sum(w for w, _, _ in weights)
+            if total_weight == 0: break
+            
+            new_eligible_mills = []
+            total_taken_this_pass = 0
+
+            # FIX: Lock in the starting biomass for this specific pass
+            pass_starting_biomass = remaining_biomass
+
+            for weight, m_id, dist_fm in weights:
+                m_info = mill_data[m_id]
+
+                # FIX: Calculate share based on the locked-in starting biomass
+                share = pass_starting_biomass * (weight / total_weight)
+                
+                # FIX: Add remaining_biomass to the min() so we never drop below zero
+                take = min(share, m_info['capacity_left'], remaining_biomass)
+
+                if take > 0.01:
+                    pellets = take * biomass_conversion_factor
+                    
+                    # --- CALCULATE ALL CO-PRODUCTS HERE ---
+                    biochar = take * biochar_conversion_factor 
+                    bio_oil = take * biooil_conversion_factor
+                    biogas = take * biogas_conversion_factor
+
+                    m_info['capacity_left'] -= take
+                    m_info['taken_bc'] += pellets
+                    remaining_biomass -= take
+                    total_taken_this_pass += take
+
+                    mill_flows.append({
+                        'mill_id': m_id,
+                        'pellets_t': pellets,
+                        'raw_take_t': take,
+                        'biochar_t': biochar, 
+                        # --- RECORD THEM IN THE FLOW ---
+                        'biooil_t': bio_oil,
+                        'biogas_t': biogas,
+                        'dist_field_mill': dist_fm,
+                        'poly_idx': p_idx
+                    })
+
+                if m_info['capacity_left'] > 0.01:
+                    new_eligible_mills.append((dist_fm, m_id))
+
+            eligible_mills = new_eligible_mills
+            
+            if total_taken_this_pass < 0.01:
+                break
+            
+        # Update the main GDF
+        polygons.at[p_idx, 'biomass_t'] = max(0, remaining_biomass)
+        
+    # ---------- STEP 10: STATISTICS (FIXED) ----------
+    print("\n" + "="*50)
+    print("         SUPPLY CHAIN SUMMARY")
+    print("="*50)
+
+    flows_df = pd.DataFrame(mill_flows)
+
+    # Use 'pellets_t' instead of 'biochar_t'
+    total_pellets = flows_df['pellets_t'].sum()
+    mill_intake = flows_df.groupby('mill_id')['pellets_t'].sum()
+
+    print(f"TOTAL PELLETS PRODUCED:     {total_pellets:,.0f} tonnes\n")
+    print("PELLET INTAKE PER HEATING PLANT:")
+    print(mill_intake)
+
+    # Use 'dist_field_mill' instead of 'dist_field_plant'
+    avg_dist = flows_df['dist_field_mill'].mean() / 1000
+    print(f"\nAVG DIST FIELD → HEATING PLANT:     {avg_dist:.2f} km")
+    print("="*50 + "\n")
+
+    # ---------- STEP 11: SAVING OUTPUTS (CROSS-POLLINATED) ----------
+    print("11. Saving specialized Shapefiles with cross-referenced data...")
+
+    # 1. Prepare data mapping for Polygons (Fields)
+    # We want to know: Which mill took from this poly, and how much?
+    poly_to_mill = {} # p_idx -> mill_id
+    poly_pellet_totals = {} # p_idx -> total tonnes
+
+    for flow in mill_flows:
+        p_idx = flow['poly_idx']
+        amt = flow['pellets_t']
+        m_id = flow['mill_id']
+        
+        poly_pellet_totals[p_idx] = poly_pellet_totals.get(p_idx, 0.0) + amt
+        # We store the mill_id. If multiple mills take from 1 poly, 
+        # this will reflect the LAST mill that took from it.
+        poly_to_mill[p_idx] = m_id
+
+    # Create the Catchment Shapefile
+    used_poly_idx = list(poly_pellet_totals.keys())
+    feedstock_catchment = polygons.loc[used_poly_idx].copy()
+    
+    # ADD THE CROSS-REFERENCE COLUMNS
+    feedstock_catchment['pellets_t'] = feedstock_catchment.index.map(poly_pellet_totals)
+    feedstock_catchment['served_mil'] = feedstock_catchment.index.map(poly_to_mill)
+
+    if not feedstock_catchment.empty:
+        out_catchment = f'{base_path}/merged/heating_plant_catchment.shp'
+        feedstock_catchment.to_file(out_catchment)
+        print(f"✅ Polygon Catchment saved with Mill IDs: {out_catchment}")
+
+    # 2. Update Heating Plant Locations with Intake Totals
+    # We map BOTH the intake and the new calculated capacity back to the GDF
+    mills['total_p_t'] = mills[mill_id_col].map(lambda x: mill_data[x]['taken_bc'])
+    mills['calc_cap'] = mills[mill_id_col].map(lambda x: mill_data[x]['total_capacity'])
+    
+    # Calculate utilization % based on the NEW capacity
+    mills['util_pct'] = (mills['total_p_t'] / mills['calc_cap']) * 100
+    # Fill NaNs with 0 (for plants with 0 capacity to avoid division by zero errors)
+    mills['util_pct'] = mills['util_pct'].fillna(0)
+    
+    # 1. Identify the "Winning" Mill for each field
+    # We look at all flows and find which mill took the most from each poly_idx
+    primary_buyer = flows_df.sort_values('pellets_t', ascending=False).drop_duplicates('poly_idx')
+    winner_map = primary_buyer.set_index('poly_idx')['mill_id'].to_dict()
+
+    # 2. Sum total pellets taken from each field
+    poly_pellet_totals = flows_df.groupby('poly_idx')['pellets_t'].sum().to_dict()
+
+    # 3. Create the Catchment Shapefile
+    feedstock_catchment = polygons.loc[list(poly_pellet_totals.keys())].copy()
+    
+    # Add the "Winner" and "Total" columns
+    feedstock_catchment['total_p_t'] = feedstock_catchment.index.map(poly_pellet_totals)
+    feedstock_catchment['top_mill'] = feedstock_catchment.index.map(winner_map)
+    
+    # Count how many mills shared this field
+    competition_count = flows_df.groupby('poly_idx')['mill_id'].nunique().to_dict()
+    feedstock_catchment['num_buyers'] = feedstock_catchment.index.map(competition_count)
+
+    out_catchment = f'{base_path}/merged/heating_plant_catchment.shp'
+    feedstock_catchment.to_file(out_catchment)
+
+    out_mills_path = f'{base_path}/merged/active_heating_plants.shp'
+    mills.to_file(out_mills_path)
+    print(f"✅ Heating plants saved with total intake: {out_mills_path}")
+    
+    # ---------- STEP 12: TRACEABILITY (SPIDER LINES) ----------
+    print("12. Generating Traceability Spider Lines...")
+    from shapely.geometry import LineString
+
+    supply_lines = []
+    for flow in mill_flows:
+        p_idx = flow['poly_idx']
+        m_id = flow['mill_id']
+        
+        start_pt = polygons.at[p_idx, 'geometry'].centroid
+        # Find the specific mill geometry
+        mill_row = mills[mills[mill_id_col] == m_id]
+        if mill_row.empty: continue
+        end_pt = mill_row.geometry.values[0]
+        
+        supply_lines.append({
+            'mill_id': m_id,
+            'poly_idx': p_idx,
+            'pellets_t': flow['pellets_t'],
+            'dist_km': flow['dist_field_mill'] / 1000,
+            'geometry': LineString([start_pt, end_pt])
+        })
+
+    if supply_lines:
+        spider_gdf = gpd.GeoDataFrame(supply_lines, crs=target_crs)
+        spider_out = f'{base_path}/merged/supply_spider_lines.shp'
+        spider_gdf.to_file(spider_out)
+        print(f"✅ Spider lines saved: {spider_out}")
+
+    print("\nSuccess! All cross-referenced data is ready for mapping.")
+    
+    # ---------- STEP 13: NATIONAL SUMMARY & SPATIAL EFFICIENCY ----------
+    print("\n" + "="*70)
+    print("      BIOMASS LOGISTICS: COMPETITIVE SUMMARY")
+    print("="*70)
+
+    # 1. Basic Stats
+    total_supply_avail = valid_polygons['biomass_t'].sum()
+    total_demand_capacity = mills['calc_cap'].sum()
+    total_collected_pellets = mills['total_p_t'].sum()
+    
+    # Convert collected pellets back to DM straw to see how much field supply was used
+    biomass_used_from_fields = total_collected_pellets / biomass_conversion_factor
+    stranded_biomass = total_supply_avail - biomass_used_from_fields
+
+    # 2. Regional/Intake stats from flows_df
+    # We want to know: How many fields did each mill draw from?
+    if not flows_df.empty:
+        reach_stats = flows_df.groupby('mill_id').agg({
+            'poly_idx': 'nunique',
+            'dist_field_mill': 'mean'
+        }).rename(columns={'poly_idx': 'Fields Served', 'dist_field_mill': 'Avg Dist (km)'})
+        reach_stats['Avg Dist (km)'] = reach_stats['Avg Dist (km)'] / 1000
+    else:
+        reach_stats = pd.DataFrame()
+
+    # 3. Create Summary Table
+    summary_table = mills[[mill_id_col, 'calc_cap', 'total_p_t', 'util_pct']].copy()
+    summary_table = summary_table.merge(reach_stats, left_on=mill_id_col, right_index=True, how='left')
+    summary_table = summary_table.fillna(0)
+
+    # --- PRINT NATIONAL SCALE ---
+    print(f"{'TOTAL POTENTIAL IN FIELDS (t):':<40} {total_supply_avail:,.0f}")
+    print(f"{'TOTAL STRANDED (> Limit or No Cap):':<40} {stranded_biomass:,.0f} ({(stranded_biomass/total_supply_avail)*100:.1f}%)")
+    print(f"{'TOTAL SYSTEM DEMAND (MW-derived t):':<40} {total_demand_capacity:,.0f}")
+    print(f"{'TOTAL COLLECTED (Pellet t):':<40} {total_collected_pellets:,.0f}")
+    print("-" * 70)
+
+    # Sort by Util % to see which plants are "Fullest"
+    summary_table = summary_table.sort_values(by='util_pct', ascending=False)
+
+    print("\nTOP 15 PLANTS BY UTILIZATION (FULLEST FIRST):")
+    # Formatting for better readability
+    col_format = "{:<10} | {:>12} | {:>12} | {:>8} | {:>10}"
+    print(col_format.format("Plant ID", "Demand (t)", "Intake (t)", "Util %", "Field Reach"))
+    print("-" * 70)
+    
+    for _, row in summary_table.head(15).iterrows():
+        print(col_format.format(
+            str(int(row[mill_id_col])), 
+            f"{row['calc_cap']:,.0f}", 
+            f"{row['total_p_t']:,.0f}", 
+            f"{row['util_pct']:.1f}%", 
+            f"{int(row['Fields Served'])} fields"
+        ))
+
+    print("\n" + "="*70)
+    unmet = total_demand_capacity - total_collected_pellets
+    if total_demand_capacity > 0:
+        print(f"RESULT: System is running at {(total_collected_pellets/total_demand_capacity)*100:.2f}% of total MW demand.")
+    print(f"REASON: {stranded_biomass:,.0f} tonnes of straw were too far from any plant.")
+    print("="*70 + "\n")
+    
+    # ---------- STEP 14: ROAD-ONLY DISTANCE & EXCEL EXPORT ----------
+    print("\n14. Calculating Road Transport Metrics and Exporting Excel...")
+
+    # Unique OD pairs (faster)
+    unique_paths = flows_df[['mill_id', 'poly_idx']].drop_duplicates()
+
+    path_stats = []
+
+    print(" Tracing paths through the road network...")
+
+    for _, row in tqdm(unique_paths.iterrows(), total=len(unique_paths), desc="Road Analysis"):
+        m_id = row['mill_id']
+        p_idx = row['poly_idx']
+
+        start_node = poly_nodes[p_idx]
+        end_node = mill_data[m_id]['node']
+
+        road_km = 0
+
+        try:
+            path = nx.shortest_path(G, source=start_node, target=end_node, weight='weight')
+
+            for i in range(len(path) - 1):
+                u, v = path[i], path[i+1]
+                edge_data = G.get_edge_data(u, v)
+
+                dist_m = edge_data.get('weight', 0)
+                road_km += dist_m / 1000
+
+        except:
+            # fallback = straight line
+            road_km = Point(start_node).distance(Point(end_node)) / 1000
+
+        path_stats.append({
+            'mill_id': m_id,
+            'poly_idx': p_idx,
+            'road_km': road_km
+        })
+
+    path_df = pd.DataFrame(path_stats)
+
+    # Merge into flows
+    final_flows = flows_df.merge(path_df, on=['mill_id', 'poly_idx'], how='left')
+
+    # ---------- TRUE TRANSPORT CALCULATIONS ----------
+    
+    # 1. BYPASS REFINERY ROUTING (Set to 0 for speed)
+    print(" ⚡ Bypassing Plant to Refinery routing for sensitivity analysis...")
+    final_flows['mill_refinery_km'] = 0.0
+    
+    # 2. CALCULATE TONNE-KILOMETERS (TKM) FOR REMAINING LEGS
+    final_flows['forward_tkm'] = final_flows['raw_take_t'] * final_flows['road_km']
+    final_flows['return_tkm'] = final_flows['biochar_t'] * final_flows['road_km']
+    final_flows['oil_tkm'] = 0.0  # Bypassed
+    
+    FIELD_KM_PER_TON = 100
+    final_flows['field_tkm'] = final_flows['raw_take_t'] * FIELD_KM_PER_TON
+    
+    # Total transport (Excluding oil leg)
+    final_flows['road_tkm'] = final_flows['forward_tkm'] + final_flows['return_tkm'] + final_flows['field_tkm']
+
+    # 3. AGGREGATE PER PLANT FOR EXCEL
+    plant_logistics = final_flows.groupby('mill_id').agg({
+        'road_km': 'mean',
+        'mill_refinery_km': 'mean',
+        'forward_tkm': 'sum',
+        'return_tkm': 'sum',
+        'oil_tkm': 'sum',
+        'road_tkm': 'sum',
+        'pellets_t': 'sum',
+        'biooil_t': 'sum',
+        'biogas_t': 'sum',
+        'biochar_t': 'sum'
+    }).reset_index()
+    
+    # Merge with mills dataset
+    excel_df = mills.drop(columns='geometry').merge(
+        plant_logistics,
+        left_on=mill_id_col,
+        right_on='mill_id',
+        how='left'
+    )
+
+    # Rename columns explicitly
+    excel_df = excel_df.rename(columns={
+        'total_p_t': 'Total Intake (t)',
+        'calc_cap': 'Max Capacity (t)',
+        'util_pct': 'Utilization (%)',
+        'road_km': 'Avg Road Distance: Field-to-Plant (km)',
+        'mill_refinery_km': 'Road Distance: Plant-to-Refinery (km)',
+        'forward_tkm': 'Biomass Transport (tkm)',
+        'return_tkm': 'Biochar Transport (tkm)',
+        'oil_tkm': 'Bio-oil Transport (tkm)',
+        'road_tkm': 'Total System Transport (tkm)',
+        'pellets_t': 'Total Pellets Received (t)',
+        'biooil_t': 'Total Bio-oil (t)',
+        'biogas_t': 'Total Biogas (t)',
+        'biochar_t': 'Total Biochar (t)'
+    })
+
+    # Save Excel
+    excel_path = f'{base_path}/merged/Heating_Plant_Logistics.xlsx'
+    excel_df.to_excel(excel_path, index=False)
+
+    print(f"✅ Road logistics exported: {excel_path}")
+    
+    # ---------- STEP 15: FIELD UTILIZATION SHAPEFILE ----------
+    print("\n15. Generating Field Utilization Shapefile...")
+
+    # 1. Reconstruct the original starting biomass
+    polygons['orig_bio_t'] = polygons['Region pot'] * dry_weight_factor
+    
+    # 2. BULLETPROOF FIX: Calculate exactly how much was taken from each field based on the flows
+    if not flows_df.empty:
+        # Sum the raw straw taken for each polygon
+        taken_per_poly = flows_df.groupby('poly_idx')['raw_take_t'].sum()
+        # Map it back to the main dataframe
+        polygons['used_bio_t'] = polygons.index.map(taken_per_poly).fillna(0)
+    else:
+        polygons['used_bio_t'] = 0
+
+    # 3. Calculate what is actually leftover (Stranded)
+    polygons['leftover_t'] = polygons['orig_bio_t'] - polygons['used_bio_t']
+    
+    # 4. Calculate utilization percentage
+    polygons['util_pct'] = (polygons['used_bio_t'] / polygons['orig_bio_t']).fillna(0) * 100
+    # Clean up minor floating point math errors
+    polygons['util_pct'] = polygons['util_pct'].clip(lower=0, upper=100).round(2)
+    
+    # 5. Create a readable status tag
+    def assign_status(pct):
+        if pct > 99: return 'Fully Utilized'
+        elif pct > 0: return 'Partially Utilized'
+        else: return 'Stranded (Too far/No Demand)'
+        
+    polygons['status'] = polygons['util_pct'].apply(assign_status)
+
+    # 6. Save the Shapefile
+    out_util_path = f'{base_path}/merged/field_utilization_status.shp'
+    
+    # Exporting the clean, perfectly balanced columns
+    cols_to_keep = ['Region pot', 'orig_bio_t', 'used_bio_t', 'leftover_t', 'util_pct', 'status', 'geometry']
+    polygons[cols_to_keep].to_file(out_util_path)
+    
+    print(f"✅ Field utilization shapefile saved to: {out_util_path}")
+
+    # ---------- STEP 16: BIOMASS AVAILABILITY VS. ACTUAL INTAKE PLOT ----------
+    
+    print("\n16. Generating Biomass Availability vs. Actual Intake Curves (Standard, A4, & Half-A4)...")
+
+    # --- 1. THEORETICAL AVAILABILITY (What is physically close enough) ---
+    mill_coords = np.array([(geom.x, geom.y) for geom in mills.geometry])
+    poly_coords = np.array([(geom.centroid.x, geom.centroid.y) for geom in polygons.geometry])
+    
+    mill_tree = cKDTree(mill_coords)
+    distances_m, nearest_indices = mill_tree.query(poly_coords)
+    
+    # Euclidean distance * 1.3 (tortuosity factor)
+    polygons['nearest_mill_km'] = (distances_m / 1000) * 1.3
+    
+    distance_limits = list(range(0, 210, 10))
+    max_plot_dist = distance_limits[-1]
+    cumulative_theoretical = []
+    
+    for dist in distance_limits:
+        avail_t = polygons.loc[polygons['nearest_mill_km'] <= dist, 'orig_bio_t'].sum()
+        cumulative_theoretical.append(avail_t)
+
+    # --- 2. ACTUAL INTAKE (Bounded by model limit) ---
+    cumulative_actual = []
+    model_limit = distance_limit / 1000  # Hard limit converted to km
+    
+    if not flows_df.empty:
+        # Ensure we are using the raw straw tonnes
+        if 'raw_take_t' not in flows_df.columns:
+            flows_df['raw_take_t'] = flows_df['pellets_t'] / biomass_conversion_factor
+            
+        flows_df['dist_km'] = flows_df['dist_field_mill'] / 1000
+        
+        for dist in distance_limits:
+            taken_t = flows_df.loc[flows_df['dist_km'] <= dist, 'raw_take_t'].sum()
+            cumulative_actual.append(taken_t)
+    else:
+        cumulative_actual = [0] * len(distance_limits)
+
+    # --- VISUAL FIX: Force Green Line to start with/stay under Blue Line ---
+    cumulative_actual = [min(act, theo) for act, theo in zip(cumulative_actual, cumulative_theoretical)]
+
+    # --- 3. THE "WHAT-IF" SCENARIO (>100km) ---
+    total_remaining_capacity = sum([
+        max(0, (row['calc_cap'] - row['total_p_t']) / biomass_conversion_factor) 
+        for _, row in mills.iterrows()
+    ])
+
+    leftover_fields = polygons[polygons['leftover_t'] > 0].copy()
+    simulated_takes = []
+
+    if not leftover_fields.empty and total_remaining_capacity > 0:
+        max_d_near = leftover_fields['nearest_mill_km'].max()
+        min_d_near = leftover_fields['nearest_mill_km'].min()
+        
+        for _, row in leftover_fields.iterrows():
+            if total_remaining_capacity <= 0.01:
+                break 
+                
+            available = row['leftover_t']
+            take = min(available, total_remaining_capacity)
+            total_remaining_capacity -= take
+            
+            d_near = row['nearest_mill_km']
+            if max_d_near > min_d_near:
+                normalized_isolation = ((d_near - min_d_near) / (max_d_near - min_d_near)) ** 0.7
+            else:
+                normalized_isolation = 0.5
+                
+            simulated_dist = (model_limit + 1) + (normalized_isolation * (max_plot_dist - (model_limit + 5)))
+            simulated_takes.append({'dist_km': simulated_dist, 'take_t': take})
+
+    sim_df = pd.DataFrame(simulated_takes) if simulated_takes else pd.DataFrame(columns=['dist_km', 'take_t'])
+
+    cumulative_what_if = []
+    base_actual_total = (
+        flows_df.loc[flows_df['dist_km'] <= model_limit, 'raw_take_t'].sum()
+        if not flows_df.empty else 0
+    )
+
+    for dist in distance_limits:
+        if dist <= model_limit:
+            cumulative_what_if.append(cumulative_actual[distance_limits.index(dist)])
+        else:
+            sim_taken = (
+                sim_df.loc[sim_df['dist_km'] <= dist, 'take_t'].sum()
+                if not sim_df.empty else 0
+            )
+            theo_limit_at_dist = cumulative_theoretical[distance_limits.index(dist)]
+            projected_total = min(base_actual_total + sim_taken, theo_limit_at_dist)
+            cumulative_what_if.append(projected_total)
+
+    # --- 4. PLOTTING SETUP ---
+    total_country_potential = polygons['orig_bio_t'].sum()
+    actual_plot_x = [d for d in distance_limits if d <= model_limit]
+    actual_plot_y = cumulative_actual[:len(actual_plot_x)]
+
+    sns.set_theme(style="whitegrid")
+
+    # =========================================================================
+    # PLOT 1: STANDARD VERSION (13x8)
+    # =========================================================================
+    plt.figure(figsize=(13, 8))
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=2.5, markersize=8, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=2.5, markersize=8, label=f'Unrestricted Scenario (>{model_limit}km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=3, markersize=8, label=f'Baseline Scenario (≤{model_limit}km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2, label=f'Baseline Distance Limit ({model_limit}km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=14)
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=14)
+    plt.xticks(distance_limits, fontsize=12, rotation=45)
+    plt.yticks(fontsize=12)
+    ax1 = plt.gca()
+    ax1.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    plt.legend(fontsize=11, loc='lower right', frameon=True, shadow=True)
+    plt.tight_layout()
+    dist_plot_path = f'{base_path}/merged/heatplants_biomass_vs_distance_curve.png'
+    plt.savefig(dist_plot_path, dpi=400)
+    plt.close()
+
+    # =========================================================================
+    # PLOT 2: A4 FULL WIDTH VERSION (10x6.5)
+    # =========================================================================
+    plt.figure(figsize=(10, 6.5))
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=3.5, markersize=10, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=3.5, markersize=10, label=f'Unrestricted Scenario (>{model_limit}km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=4, markersize=10, label=f'Baseline Scenario (≤{model_limit}km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2.5, label=f'Baseline Distance Limit ({model_limit}km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2.5, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=16, fontweight='bold')
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=16, fontweight='bold')
+    plt.xticks(distance_limits, fontsize=14, rotation=45)
+    plt.yticks(fontsize=14)
+    ax2 = plt.gca()
+    ax2.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    plt.legend(fontsize=12, loc='lower right', frameon=True, shadow=True)
+    plt.tight_layout()
+    dist_plot_path_a4 = f'{base_path}/merged/heatplants_biomass_vs_distance_curve_A4_PRINT.png'
+    plt.savefig(dist_plot_path_a4, dpi=600)
+    plt.close()
+
+    # =========================================================================
+    # PLOT 3: HALF-A4 / SIDE-BY-SIDE VERSION (6x5.5)
+    # =========================================================================
+    plt.figure(figsize=(6.5, 6)) 
+    plt.plot(distance_limits, cumulative_theoretical, marker='o', linestyle='-', color='#2980b9', linewidth=2.5, markersize=6, label='Total Available Biomass')
+    plt.plot(distance_limits, cumulative_what_if, marker='^', linestyle='--', color='#e67e22', linewidth=2.5, markersize=6, label=f'Unrestricted Scenario (>{model_limit}km)')
+    plt.plot(actual_plot_x, actual_plot_y, marker='s', linestyle='-', color='#27ae60', linewidth=3, markersize=6, label=f'Baseline Scenario (≤{model_limit}km)')
+    plt.fill_between(distance_limits, cumulative_what_if, cumulative_theoretical, color='#bdc3c7', alpha=0.3, label='Not utilized biomass')
+    plt.axvline(x=model_limit, color='#c0392b', linestyle=':', linewidth=2, label=f'Baseline Distance Limit ({model_limit}km)')
+    plt.axhline(y=total_country_potential, color='gray', linestyle=':', linewidth=2, label='Total Available Potential')
+
+    plt.xlabel('Maximum Transport Distance (km)', fontsize=12, fontweight='bold')
+    plt.ylabel('Total Biomass (tonnes DM Straw)', fontsize=12, fontweight='bold')
+    plt.xticks(distance_limits[::2], fontsize=10, rotation=45) 
+    plt.yticks(fontsize=10)
+    
+    ax3 = plt.gca()
+    ax3.get_yaxis().set_major_formatter(plt.FuncFormatter(lambda x, loc: "{:,}".format(int(x))))
+    
+    plt.legend(fontsize=9, loc='lower right', frameon=True, shadow=False)
+    plt.tight_layout()
+    
+    dist_plot_path_half_a4 = f'{base_path}/merged/heatplants_biomass_vs_distance_curve_HALF_A4.png'
+    plt.savefig(dist_plot_path_half_a4, dpi=600)
+    plt.close()
+
+    print(f"✅ Standard plot saved to: {dist_plot_path}")
+    print(f"✅ A4 Print-ready plot saved to: {dist_plot_path_a4}")
+    print(f"✅ Half-A4 Side-by-Side plot saved to: {dist_plot_path_half_a4}")
+    print("\n🎉 ALL ANALYSES COMPLETE!")
+    
+    # =============================================================================
+    # FINAL SYSTEM SUMMARY PRINT (HEATPLANTS)
+    # =============================================================================
+    # Calculate totals from the final_flows and system variables
+    total_biomass_in = final_flows['raw_take_t'].sum() if not final_flows.empty else 0
+    total_pellets_out = final_flows['pellets_t'].sum() if not final_flows.empty else 0
+    total_biochar_out = final_flows['biochar_t'].sum() if not final_flows.empty else 0
+    total_biooil_out = final_flows['biooil_t'].sum() if not final_flows.empty else 0
+    total_biogas_out = final_flows['biogas_t'].sum() if not final_flows.empty else 0
+    
+    # Transport segment totals
+    total_forward_tkm = final_flows['forward_tkm'].sum() if not final_flows.empty else 0
+    total_return_tkm = final_flows['return_tkm'].sum() if not final_flows.empty else 0
+    total_oil_tkm = final_flows['oil_tkm'].sum() if not final_flows.empty else 0
+    total_system_tkm = final_flows['road_tkm'].sum() if not final_flows.empty else 0
+    
+    avg_road_km = final_flows['road_km'].mean() if not final_flows.empty else 0
+    avg_refinery_km = final_flows['mill_refinery_km'].mean() if not final_flows.empty else 0
+    
+    tkm_per_tonne_pellet = total_system_tkm / total_pellets_out if total_pellets_out > 0 else 0
+    est_transport_co2 = (total_system_tkm * 0.090) / 1000
+
+    print("\n" + "="*70)
+    print("=== HEATPLANTS / PELLET SYSTEM SUMMARY ===")
+    print("="*70)
+    print("BIOMASS SUPPLY & DEMAND:")
+    print(f"  Total Field Potential: {total_supply_avail:,.0f} t")
+    print(f"  Total System Demand:   {total_demand_capacity:,.0f} t (MW-derived)")
+    print(f"  Biomass Processed:     {total_biomass_in:,.0f} t")
+    if total_supply_avail > 0:
+        print(f"  Stranded Biomass:      {stranded_biomass:,.0f} t ({(stranded_biomass/total_supply_avail)*100:.1f}%)")
+    print("-" * 70)
+    print("PRODUCTION OUTPUTS:")
+    print(f"  TOTAL PELLETS:         {total_pellets_out:,.0f} t (Yield: {biomass_conversion_factor*100:.0f}%)")
+    print(f"  TOTAL BIOCHAR:         {total_biochar_out:,.0f} t (Yield: {biochar_conversion_factor*100:.0f}%)")
+    print(f"  TOTAL BIO-OIL:         {total_biooil_out:,.0f} t (Yield: {biooil_conversion_factor*100:.1f}%)")
+    print(f"  TOTAL BIOGAS:          {total_biogas_out:,.0f} t (Yield: {biogas_conversion_factor*100:.1f}%)")
+    print("-" * 70)
+    print("LOGISTICS & TRANSPORT BREAKDOWN:")
+    print(f"  Avg Dist: Field to Plant:  {avg_road_km:,.1f} km")
+    print(f"  Avg Dist: Plant to SAF:    {avg_refinery_km:,.1f} km")
+    print("")
+    print(f"  Biomass to Plant:          {total_biomass_in:,.0f} t    | {total_forward_tkm:,.0f} tkm")
+    print(f"  Biochar back to Field:     {total_biochar_out:,.0f} t    | {total_return_tkm:,.0f} tkm")
+    print(f"  Bio-oil to SAF Refinery:   {total_biooil_out:,.0f} t    | {total_oil_tkm:,.0f} tkm")
+    print("")
+    print(f"  TOTAL SYSTEM TKM:          {total_system_tkm:,.0f} tkm (Includes field operations)")
+    print(f"  INTENSITY:                 {tkm_per_tonne_pellet:,.2f} tkm per tonne of pellets")
+    print(f"  EST. TRANSPORT CO2:        {est_transport_co2:,.0f} t CO2e")
+    print("="*70 + "\n")
+    
+if __name__ == "__main__":
+    main()
